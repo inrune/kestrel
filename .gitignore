@@ -1,0 +1,56 @@
+# ─────────────────────────────────────────────────────────────────────
+# Kestrel — repository ignore rules (top level).
+#
+# The three app folders each carry their own .gitignore too; this root
+# file is the safety net so that NONE of the following can ever be
+# committed by accident when you publish the whole project at once.
+# ─────────────────────────────────────────────────────────────────────
+
+# --- SECRETS: never commit a wallet. Anyone with the file spends the coins.
+kestrel-wallet.json
+**/kestrel-wallet.json
+*.wif
+
+# --- Local node state (rebuilt from genesis / the network on next launch)
+kestrel-data/
+**/kestrel-data/
+seeds-cache.txt
+**/seeds-cache.txt
+dht-nodes.json
+**/dht-nodes.json
+peers.json
+**/peers.json
+
+# --- Operator's LIVE seed list (the example file, seeds.example.txt, is
+#     tracked; your real seeds.txt with your node's IP is not)
+seeds.txt
+**/seeds.txt
+
+# --- App settings written at runtime
+*-settings.json
+**/*-settings.json
+
+# --- Multi-node test directories (node1/, node2/, …)
+node[0-9]*/
+**/node[0-9]*/
+
+# --- Release build artifacts (produced by ./build-apps.sh)
+kestrel-core.zip
+kestrel-miner.zip
+kestrel-wallet.zip
+
+# --- Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- Editor / OS clutter
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
