@@ -69,7 +69,7 @@ GENESIS_TARGET = MAX_TARGET
 #   python -m kestrel.cli start --host 0.0.0.0
 # on it, put its URL here, and ship. Everyone who runs any Kestrel app
 # then joins the same network automatically.
-SEED_NODES: list[str] = []
+SEED_NODES: list[str] = ["http://57.131.145.6:4444"]
 
 # Seed LISTS fetched over HTTPS at startup — Bitcoin's DNS-seed idea as a
 # plain text file. Host a file of node URLs (one per line, # comments ok)
@@ -78,5 +78,5 @@ SEED_NODES: list[str] = []
 # re-shipping the apps: every node checks the list each launch and caches
 # it for offline starts.
 # Example:
-#   SEED_LIST_URLS = ["https://raw.githubusercontent.com/<you>/kestrel-seeds/main/seeds.txt"]
-SEED_LIST_URLS: list[str] = []
+#   Note from inrune i will update the seed list on the github quite often 
+SEED_LIST_URLS: list[str] = ["https://raw.githubusercontent.com/inrune/kestrel/main/seeds.txt"]
