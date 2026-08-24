@@ -1,0 +1,43 @@
+# Reference systemd unit for a Kestrel anchor node.
+#
+# deploy/setup-vps.sh generates this for you automatically. This copy is
+# here for transparency and for manual installs (e.g. non-Ubuntu distros).
+# To use it by hand:
+#   1. install the code at /opt/kestrel/kestrel-core with a venv at
+#      /opt/kestrel/venv  (pip install -r requirements.txt)
+#   2. create user 'kestrel' and: chown -R kestrel:kestrel /opt/kestrel
+#   3. copy this file to /etc/systemd/system/kestrel-node.service
+#   4. sudo systemctl daemon-reload && sudo systemctl enable --now kestrel-node
+#
+# Change the port by editing the two places it appears below.
+
+[Unit]
+Description=Kestrel (KSL) anchor node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kestrel
+Group=kestrel
+WorkingDirectory=/opt/kestrel/kestrel-core
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/kestrel/venv/bin/python -m kestrel.cli --data-dir /opt/kestrel/kestrel-core/kestrel-data node --host 0.0.0.0 --port 4444
+Restart=always
+RestartSec=5
+
+# Hardening — the node needs to write only its own data directory.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/kestrel/kestrel-core/kestrel-data
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
