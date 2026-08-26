@@ -5,13 +5,55 @@
 ![Proof of Work: scrypt](https://img.shields.io/badge/PoW-scrypt-orange.svg)
 ![Supply: 44M KSL](https://img.shields.io/badge/supply-44M%20KSL-yellow.svg)
 
-**Fast, light, decentralized money.** Kestrel is a fair-launch, scrypt
-proof-of-work chain, hard-capped at **44,000,000 KSL** — no premine, no
-company, and an unspendable genesis reward. It's small on purpose: a node, a
-miner, a wallet, and roughly 1,500 lines of readable Python resting on a
-single dependency (`ecdsa`). Explorers, pools, and markets are yours to
-build — every node serves the full chain as open JSON, with a live dashboard
-in any browser.
+**Fast, light, decentralized money.** A fair-launch, scrypt proof-of-work
+chain hard-capped at **44,000,000 KSL** — no premine, no company, no ICO, and
+a genesis reward that can never be spent.
+
+It is small on purpose: a node, a miner, a wallet, and roughly 1,500 lines of
+readable Python resting on a single dependency. You can read the entire rule
+set in an evening, which is the point — the consensus code *is* the money, so
+it should be short enough to actually check.
+
+```
+Download → extract → run. It finds the network by itself.
+```
+
+---
+
+## Get started in two minutes
+
+You need **Python 3.10 or newer** ([python.org](https://www.python.org/downloads/) —
+on Windows, tick *"Add python.exe to PATH"* in the installer). Everything else
+installs itself on first launch.
+
+Grab a zip from [**Releases**](https://github.com/inrune/kestrel/releases),
+extract it anywhere, then:
+
+| | Windows | Mac / Linux |
+|---|---|---|
+| **Mine** — earn KSL | `kestrel-miner` ▸ `run.bat` | `kestrel-miner` ▸ `./run.sh` |
+| **Hold & send** | `kestrel-wallet` ▸ `run.bat` | `kestrel-wallet` ▸ `./run.sh` |
+
+The miner has a wallet built in, so one app is enough to mine, hold and spend.
+Back up the key it shows you the first time — see
+[Keep your coins](#keep-your-coins).
+
+### Or use the command line
+
+```bash
+cd kestrel-core
+pip install -r requirements.txt
+
+python -m kestrel.cli start           # create a wallet, run a full node
+python -m kestrel.cli mine --blocks 12
+python -m kestrel.cli balance
+python -m kestrel.cli send K<address> 3.5
+python -m kestrel.cli info
+```
+
+---
+
+## The numbers
 
 | | |
 |---|---|
@@ -19,160 +61,193 @@ in any browser.
 | block time | 120 seconds |
 | initial reward | 25 KSL, halving every 880,000 blocks (~3.3 years) |
 | supply cap | 44,000,000 KSL (exact) |
+| coinbase maturity | 10 blocks |
 | smallest unit | 1 feather = 0.00000001 KSL |
 | addresses | base58check, start with `K` |
 | default port | 4444 |
 | license | MIT |
 
-The cap isn't a separate rule — it falls out of the schedule:
-880,000 blocks × (25 + 12.5 + 6.25 + …) = exactly 44,000,000 KSL. There's
-nothing extra to trust.
+The cap is not a separate rule bolted on top — it falls out of the schedule:
 
-## What's in this folder
+```
+880,000 blocks × (25 + 12.5 + 6.25 + …) = exactly 44,000,000 KSL
+```
+
+There is nothing extra to trust.
+
+---
+
+## What's in here
 
 | Path | What it is |
 |---|---|
-| `kestrel-core/` | The reference implementation — consensus, node, miner, wallet and CLI. Start here to read or verify the rules. |
-| `kestrel-miner/` | **Kestrel Miner** — the one-button desktop mining app (a full node is built in). |
-| `kestrel-wallet/` | **Kestrel Wallet** — the desktop wallet: keys and signing stay on your machine. |
-| `KESTREL-WHITEPAPER.docx` | The whitepaper (also `kestrel-core/docs/WHITEPAPER.md`). |
+| `kestrel-core/` | The reference implementation — consensus, node, miner, wallet, CLI. **Start here to verify the rules.** |
+| `kestrel-miner/` | Desktop mining app. Full node and wallet built in. |
+| `kestrel-wallet/` | Desktop wallet. Keys and signing never leave your machine. |
+| `tests/` | The test suite. `./run-tests.sh` |
+| `deploy/` | One-command VPS node setup + the go-public walkthrough. |
 | `build-apps.sh` | Rebuilds the three release zips. |
-| `deploy/` | One-command VPS anchor-node setup + the go-public walkthrough (`deploy/DEPLOY.md`). |
-| `tests/` | Automated test suite (consensus, crypto, wallet, networking). Run `./run-tests.sh`. |
+| `KESTREL-WHITEPAPER.docx` | The whitepaper (also `kestrel-core/docs/WHITEPAPER.md`). |
 
-The three folders each ship a self-contained copy of the `kestrel/` package,
-so any one of them runs on its own. Keys use the same `kestrel-wallet.json`
-format everywhere, so they move freely between the CLI, the miner and the
-wallet.
+Each of the three app folders ships a self-contained copy of the `kestrel/`
+package, so any one of them runs on its own. Keys use the same
+`kestrel-wallet.json` format everywhere and move freely between them.
 
-## Quick start
+---
 
-Everything needs **Python 3.10+** and the one dependency (`ecdsa`), which the
-launch scripts install for you.
+## Every node is an explorer
 
-**Mine (desktop app)** — open `kestrel-miner/`, run `run.bat` (Windows) or
-`run.sh` (Mac/Linux). It creates a reward address, starts a full node, and
-connects to the network by itself. Press **Start mining**.
+Start any node and open its address in a browser — locally that is
+**http://localhost:4444/**. You get a live view of the chain: height,
+circulating supply and percentage of the cap mined, difficulty and estimated
+network hashrate, the halving countdown, connected peers, the newest blocks,
+the largest holders, and a search box that opens any block, transaction or
+address.
 
-**Hold & send (desktop app)** — open `kestrel-wallet/`, run `run.bat` /
-`run.sh`. Back up the key it shows you once.
+It is one self-contained file with no extra dependencies, built on the node's
+public JSON API — so the same URL still serves JSON to programs, and nothing
+about the API changes. Explorers, pools and markets are yours to build.
 
-**Command line** — from `kestrel-core/`:
+---
 
-```
-pip install -r requirements.txt
-python -m kestrel.cli start          # create a wallet + run a full node
-python -m kestrel.cli mine --blocks 12
-python -m kestrel.cli balance
-python -m kestrel.cli send K<address> 3.5
-python -m kestrel.cli info
-```
+## Networking that just works
 
-## The node dashboard
+Nodes find each other the way Bitcoin launched, plus a few conveniences:
+worldwide discovery over the public BitTorrent DHT, LAN discovery, seed nodes
+and published seed lists, automatic router port-opening (UPnP), peer exchange
+and block gossip.
 
-Start any node and open its URL in a browser — for a local node that's
-**http://localhost:4444/**. You get a live view of the network: height,
-circulating supply and the % of the cap mined, difficulty and estimated
-network hashrate, the halving countdown, connected peers with liveness, the
-newest blocks, the richest addresses, and a search box that opens any block,
-transaction or address.
+Open two Kestrel apps anywhere on Earth and they find each other with nothing
+to type.
 
-It's a single self-contained file (`kestrel/dashboard.py`) that adds no
-dependencies of its own, built entirely on the node's public JSON endpoints
-— so API clients still get JSON at the same URL, and nothing about the API
-changes. The miner's built-in node serves it too (Network ▸ **Open
-dashboard**), and the wallet can open it from Settings ▸ **Open node
-dashboard**.
+Full detail — including the honest parts about NAT and reachability — is in
+[`kestrel-core/README.md`](kestrel-core/README.md). To run an always-on node
+and go public in about fifteen minutes, follow
+[`deploy/DEPLOY.md`](deploy/DEPLOY.md). **More independent nodes is the single
+best thing anyone can do for the network.**
 
-## Networking — ready out of the box
+---
 
-Nodes connect themselves the way Bitcoin launched: worldwide auto-discovery
-over the public BitTorrent DHT, LAN discovery, seed nodes and published seed
-lists, automatic router port-opening (UPnP), peer exchange and gossip. Open
-two Kestrel apps anywhere on Earth and they find each other with nothing to
-type. Full detail — including the honest bits about NAT and reachability, and
-a public-launch checklist — is in
-[`kestrel-core/README.md`](kestrel-core/README.md). To stand up an always-on
-anchor node and go public in ~15 minutes, follow
-[`deploy/DEPLOY.md`](deploy/DEPLOY.md).
+## Keep your coins
 
-## Build the release zips
+Your wallet file **is** your money. Read this bit properly:
 
-```
-./build-apps.sh
-```
+- **Back up `kestrel-wallet.json`** (or the backup key the app shows you) to
+  something offline — a USB stick, a piece of paper in a drawer.
+- **Lose it and the coins are gone.** There is no password reset, no support
+  line, no recovery. Nobody can help you, including us.
+- **Leak it and they are stolen.** Anyone holding that file can spend from it.
+- **Never commit it to Git.** The included `.gitignore` blocks it, but check
+  `git status` anyway before you push.
 
-Produces `kestrel-core.zip`, `kestrel-miner.zip` and `kestrel-wallet.zip`
-next to the website, excluding caches, backups, keys and local chain data.
+---
 
-## Security & disclaimer
+## Honest limitations
 
-Kestrel is young, experimental software released under the MIT license — it
-comes with no warranty, and you run it at your own risk. A few things worth
-knowing up front:
+Kestrel is young, experimental software under the MIT license. No warranty,
+run it at your own risk.
 
-- **Your keys are yours.** The wallet keeps private keys and signing on your
-  own machine. Back up `kestrel-wallet.json` (or the backup key it shows you)
-  somewhere safe and offline — lose it and the coins are gone; leak it and
-  they're stolen. No one can recover it for you.
-- **Small network, early days.** A young chain carries little accumulated
-  proof-of-work, which makes it easier to disrupt than an established one.
-  Treat balances and confirmations accordingly until the network grows.
-- **Verify, don't trust.** The consensus rules are ~1,500 lines of Python in
-  `kestrel-core/kestrel/`. Read them, run the tests, and satisfy yourself
-  before committing anything you can't afford to lose.
+- **A small network is easier to disrupt.** A young chain carries little
+  accumulated proof-of-work. Treat balances and confirmation counts with that
+  in mind until it grows.
+- **Verify, don't trust.** The rules are ~1,500 lines in
+  `kestrel-core/kestrel/`. Read them, run the tests, satisfy yourself before
+  committing anything you cannot afford to lose.
 - **Not financial advice.** This is a technical project, not an investment,
-  and nothing here is a promise of value.
+  and nothing here promises value.
+
+---
 
 ## Contributing
 
-Issues and pull requests are welcome. The test suite (`./run-tests.sh`) and
-the GitHub Actions CI run the consensus, crypto, wallet and networking tests
-on Python 3.10–3.12 — please keep them green, and add tests for anything that
-touches the rules. Because the consensus code *is* the money, changes there
-get read closely.
+Issues and pull requests welcome. `./run-tests.sh` and the GitHub Actions CI
+run the consensus, crypto, wallet, durability and networking tests on Python
+3.10–3.12 — please keep them green and add tests for anything touching the
+rules. Because the consensus code is the money, changes there get read
+closely.
+
+---
 
 ## Changelog
 
-### v1.4.2
+### v1.4.6 — no more accidental private chains
 
-- **Node:** mining through the JSON API (`POST /mine`, used by
-  `kestrel.cli mine` when a node is already running) no longer holds the chain
-  lock during the proof-of-work grind. The node's dashboard, API and
-  background sync now stay fully responsive while it mines, and an incoming
-  network block interrupts the round so work is never wasted on a stale tip.
-  The desktop miner already worked this way; the endpoint now matches.
-- **Tests + CI:** added an automated test suite (`tests/`, run with
-  `./run-tests.sh`) covering the consensus rules, cryptography, wallet and
-  live two-node networking, plus a GitHub Actions workflow that runs it on
-  every push across Python 3.10–3.12.
-- **Deploy kit:** added `deploy/` — a one-command VPS anchor-node installer
-  (`setup-vps.sh`, systemd + firewall), a seed-wiring helper (`set-seeds.sh`),
-  and a full go-public walkthrough (`deploy/DEPLOY.md`).
-- Added the `build-apps.sh` release packager the READMEs referenced, a
-  repo-root `.gitignore`/`LICENSE`, and stopped shipping throwaway keys and
-  local chain data in the source tree.
+- **A node can no longer start its own chain by accident.** Mining used to
+  begin the instant you pressed Start, before the app had spoken to any other
+  node. At the starting difficulty a few seconds of solo mining can outweigh
+  the entire real network, after which this node correctly refuses to switch
+  and the two chains never reconcile — which is why the only cure used to be
+  deleting your ledger by hand. The app now finds the network first and mines
+  on the shared chain. If nobody answers it says so plainly and starts a new
+  network on purpose rather than by mistake.
+- **"Rebuild from the network" button.** If a node ever does end up out of
+  step, one button in Network re-downloads the chain from other nodes and
+  adopts theirs if it is better. Wallets and coins are untouched. Nobody
+  should ever have to close the app and delete files to get unstuck.
+- **Update notices.** A quiet strip appears when a newer version exists, with
+  a link to the downloads page. It never installs anything, and if the check
+  fails it stays silent rather than guessing.
+
+### v1.4.5 — two ways to lose money, closed
+
+- **Reorgs no longer destroy payments.** When a node switched to a heavier
+  chain, transactions already confirmed in the discarded blocks were simply
+  dropped — the money reverted to the sender and the recipient was never paid,
+  with nothing anywhere to show it had happened. They are now re-queued and
+  mined into the new chain, the way Bitcoin has always handled it.
+- **The wallet file can no longer be corrupted by a crash.** It used to be
+  written by truncating the real file in place, so a crash or power cut
+  part-way through left a broken wallet — and that file is the money. Writes
+  now go to a temporary file, are flushed to disk, and only then replace the
+  old one. A wallet for a different address is copied aside rather than
+  overwritten, so no bug can silently destroy somebody's keys.
+
+### v1.4.4 — wallet in the miner, block explorer
+
+- The miner gained a **Wallet tab**: balance split into spendable / confirmed
+  / maturing, a send form, and transaction history. No second app needed to
+  spend what you mine.
+- The website gained a **live block explorer** — search any block, transaction
+  or address, browse recent activity and the largest holders.
+
+### v1.4.3 — the fork that could not heal
+
+- **Miners behind a router were silently forking off.** Syncing only worked by
+  *pulling* from a peer, which cannot work when that peer is a home machine
+  behind NAT — the most common setup there is. Once two chains diverged
+  neither side could repair it and both kept mining in parallel forever. Nodes
+  now push their chain to a peer that cannot be pulled from. A lighter chain
+  still can never displace a heavier one, so this adds no way to rewrite
+  history.
+
+### v1.4.2 — responsive nodes, tests, deploy kit
+
+- Mining through the JSON API no longer holds the chain lock during the
+  proof-of-work grind, so the dashboard, API and background sync stay
+  responsive while mining.
+- Added the automated test suite and GitHub Actions CI across Python
+  3.10–3.12.
+- Added `deploy/` — one-command VPS node installer, seed-wiring helper, and
+  the go-public walkthrough.
+- Added `build-apps.sh`, a repo-root `.gitignore` and `LICENSE`, and stopped
+  shipping throwaway keys or local chain data in the source tree.
 
 <details>
 <summary><strong>v1.4.1</strong></summary>
 
 - **Wallet:** fixed a crash that showed an empty, frozen dialog when opening
   *Connect to a network node*, *Node address*, *Restore from key*, *Share this
-  computer's node* or *Show backup key*. All dialogs now open centered over the
-  window and can't lock the app even if something fails.
+  computer's node* or *Show backup key*.
 - **Miner + Wallet:** repaired the bundled `discovery.py` and `rendezvous.py`,
-  which had shipped truncated — LAN auto-discovery crashed on the first packet
-  heard and worldwide DHT discovery silently did nothing. Both now match the
-  reference implementation exactly.
-- **Both apps:** the connect boxes accept loose addresses — `12.34.56.78`,
-  `12.34.56.78:4444` and full URLs all work, matching the node API.
+  which had shipped truncated — LAN discovery crashed on the first packet and
+  worldwide DHT discovery silently did nothing.
+- **Both apps:** connect boxes accept loose addresses — `12.34.56.78`,
+  `12.34.56.78:4444` and full URLs all work.
 - **Wallet:** quitting now shuts the built-in node down cleanly.
-- Added the `build-apps.sh` release packager the README always promised (it
-  excludes keys, chain data and caches from the zips), refreshed the website
-  (live node stats, networking section, more FAQ) and fixed its stale version
-  strings.
 
 </details>
+
+---
 
 ## License
 
