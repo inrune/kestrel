@@ -77,6 +77,8 @@ MAX_FAILS = 6          # consecutive failures before a non-seed peer is dropped
 NEW_PEER_FAILS = 3     # ...but a peer that NEVER answered is dropped sooner
 SYNC_WORKERS = 8       # parallel peer connections (dead peers can't stall us)
 MAX_PUSH_BLOCKS = 50_000    # cap on a chain pushed to us via POST /chain
+ALONE_AFTER_ATTEMPTS = 4    # sync rounds with no answer before we accept
+                            # that this really is a network of one
 REMAP_INTERVAL = 15 * 60    # re-ask the router for the port (renew/reboot)
 RECHECK_INTERVAL = 10 * 60  # re-test reachability (things change)
 SEED_REFRESH = 10 * 60      # re-fetch published seed lists while peerless
@@ -122,6 +124,8 @@ class Node:
         os.makedirs(chain.data_dir, exist_ok=True)
         self._save_peers()
         self._stop = threading.Event()
+        self._sync_attempts = 0
+        self.joined_network = False
         self._last_remap = 0.0        # when we last asked the router
         self._last_recheck = 0.0      # when we last tested reachability
         self._last_seedfetch = 0.0    # when we last pulled the seed lists
@@ -462,10 +466,95 @@ class Node:
         dead peer costs nothing and a live one connects immediately."""
         peers = list(self.peers)
         if not peers:
+            self._sync_attempts += 1
             return
         with ThreadPoolExecutor(
                 max_workers=min(SYNC_WORKERS, len(peers))) as ex:
             list(ex.map(self._sync_quiet, peers))
+        self._sync_attempts += 1
+        if self.alive_peers():
+            self.joined_network = True
+
+    def network_state(self) -> str:
+        """Where we stand relative to the rest of the network.
+
+        Mining before we know this is how a node ends up quietly building
+        its own private chain: at the starting difficulty a few seconds of
+        solo mining can outweigh the real network, after which this node
+        correctly refuses to switch and the two never reconcile again.
+
+        'joined'   — we have reached at least one other node
+        'looking'  — still trying; too early to say we are alone
+        'alone'    — nobody answered after a fair number of attempts, so
+                     this is genuinely a new or isolated network
+        """
+        if self.joined_network or self.alive_peers():
+            return "joined"
+        if self._sync_attempts < ALONE_AFTER_ATTEMPTS:
+            return "looking"
+        return "alone"
+
+    def wait_until_known(self, timeout: float = 45.0) -> str:
+        """Block until we know whether we are on the network or alone.
+
+        This drives the search itself rather than waiting on the periodic
+        sync loop, which only ticks every SYNC_INTERVAL seconds — far too
+        slow to keep a user staring at a Start button. It never returns
+        "looking": once the time is up having reached nobody, the honest
+        answer is that we are alone.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline and not self._stop.is_set():
+            if self.joined_network or self.alive_peers():
+                return "joined"
+            self.sync_once()
+            if self.joined_network or self.alive_peers():
+                return "joined"
+            if self.network_state() == "alone":
+                return "alone"
+            self._stop.wait(1.5)
+        return "joined" if self.alive_peers() else "alone"
+
+    def resync_from_network(self) -> tuple[bool, str]:
+        """Rebuild this node's ledger from the network.
+
+        The manual version of this was 'quit the app and delete your
+        chain file', which is alarming, easy to get wrong, and sits one
+        slip away from deleting the wallet next to it. This does the same
+        job safely: it asks every peer for its chain and adopts the
+        heaviest valid one, keeping our own if ours still wins.
+
+        Returns (changed, human-readable message).
+        """
+        peers = self.alive_peers() or list(self.peers)
+        if not peers:
+            return False, ("No other nodes are reachable right now, so "
+                           "there is nothing to rebuild from. Check your "
+                           "internet connection and try again in a moment.")
+        before = self.chain.height
+        best = None
+        for peer in peers:
+            try:
+                data = self._http_json("GET", peer + "/chain", timeout=120)
+                blocks = data.get("blocks") or []
+                if blocks and (best is None or len(blocks) > len(best)):
+                    best = blocks
+            except Exception:
+                continue
+        if not best:
+            return False, ("Could not download a chain from any node. "
+                           "They may be busy — try again shortly.")
+        try:
+            with self.lock:
+                took = self.chain.maybe_replace(best)
+                after = self.chain.height
+        except ValidationError as e:
+            return False, f"The chain offered by the network was rejected: {e}"
+        if took:
+            return True, (f"Rebuilt from the network — now on the shared "
+                          f"chain at block {after:,} (was {before:,}).")
+        return False, (f"Already on the best chain the network has "
+                       f"(block {before:,}). Nothing needed changing.")
 
     def _maintain(self):
         """Periodic self-healing, called from the sync loop.

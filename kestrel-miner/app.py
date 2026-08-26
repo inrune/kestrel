@@ -34,7 +34,7 @@ for cand in (_HERE, os.path.abspath(os.path.join(_HERE, "..", ".."))):
         sys.path.insert(0, cand)
         break
 
-from kestrel import params, __version__ as KVER             # noqa: E402
+from kestrel import params, updates, __version__ as KVER    # noqa: E402
 from kestrel.blockchain import Blockchain, ValidationError   # noqa: E402
 from kestrel.wallet import Wallet, format_ksl, parse_ksl    # noqa: E402
 from kestrel.crypto_utils import is_valid_address, private_to_wif  # noqa: E402
@@ -941,6 +941,21 @@ class App(tk.Tk):
             builder(f)
             self._views[name] = f
 
+        # A quiet strip that only ever appears if a newer version exists.
+        self.update_bar = tk.Frame(self, bg=DUSK3)
+        self.update_msg = tk.StringVar(value="")
+        tk.Label(self.update_bar, textvariable=self.update_msg, bg=DUSK3,
+                 fg=BUFF, font=SANS_9, anchor="w", padx=14,
+                 pady=6).pack(side="left", fill="x", expand=True)
+        self._btn(self.update_bar, "Get it", self._open_releases,
+                  primary=True, tip="Open the downloads page"
+                  ).pack(side="right", padx=(0, 8), pady=4)
+        self._btn(self.update_bar, "Later",
+                  lambda: self.update_bar.pack_forget(),
+                  tip="Hide this until next launch"
+                  ).pack(side="right", padx=(0, 6), pady=4)
+        # deliberately not packed — shown only by _offer_update
+
         sb = tk.Frame(self, bg=SPOT)
         sb.pack(fill="x", side="bottom")
         self.status_var = tk.StringVar()
@@ -959,6 +974,43 @@ class App(tk.Tk):
                  font=SANS_9, anchor="w", padx=14,
                  pady=5).pack(side="left", fill="x", expand=True)
         self.show_view("Mine")
+        updates.check(self._offer_update)
+
+    def _open_releases(self):
+        import webbrowser
+        webbrowser.open(updates.RELEASES_PAGE)
+
+    def _offer_update(self, latest, url):
+        """Called from the update check — only when one really exists."""
+        def show():
+            self.update_msg.set(
+                f"Kestrel {latest} is available — you're on {KVER}. "
+                f"Updating keeps you in step with the network.")
+            self.update_bar.pack(fill="x", side="bottom")
+        self.after(0, show)
+
+    def _repair_chain(self):
+        """Rebuild the ledger from the network, so nobody ever has to go
+        and delete their chain file by hand to get unstuck."""
+        if self.mining.is_set():
+            messagebox.showinfo(
+                "Stop mining first",
+                "Stop mining before rebuilding, so the repair isn't racing "
+                "against new blocks.")
+            return
+        if not messagebox.askyesno(
+                "Rebuild from the network?",
+                "This downloads the chain from the other nodes and switches "
+                "to it if theirs is better than yours.\n\n"
+                "Your wallet and your coins are not touched — only the "
+                "shared ledger is refreshed.\n\nContinue?"):
+            return
+        self.toast("Rebuilding from the network…")
+
+        def run():
+            ok, msg = self.node.resync_from_network()
+            self.q.put(("repaired", ok, msg))
+        threading.Thread(target=run, daemon=True).start()
 
     def _tick_now(self):
         self._refresh_stats()
@@ -1508,6 +1560,22 @@ class App(tk.Tk):
         self.chip_mem = self._chip(chips, "PENDING TXS")
         self.chip_height = self._chip(chips, "BLOCK HEIGHT")
 
+        # Getting unstuck should be a button, not a folder full of files the
+        # user has to find and delete with the app closed.
+        fix = tk.Frame(p, bg=DUSK2); fix.pack(fill="x", pady=(0, 12))
+        fc = tk.Frame(fix, bg=DUSK2); fc.pack(fill="x", padx=18, pady=12)
+        tk.Label(fc, text="OUT OF STEP WITH EVERYONE ELSE?", bg=DUSK2,
+                 fg=MUTED, font=TINY_B).pack(anchor="w")
+        tk.Label(fc, text="If your block height is stuck or looks nothing "
+                          "like the rest of the network, rebuild the ledger "
+                          "from the other nodes. Your wallet and coins are "
+                          "not touched.",
+                 bg=DUSK2, fg=FAINT, font=SANS_9, wraplength=620,
+                 justify="left").pack(anchor="w", pady=(4, 9))
+        self._btn(fc, "Rebuild from the network", self._repair_chain,
+                  tip="Download the chain from other nodes and switch to "
+                      "it if theirs is better").pack(anchor="w")
+
         share = tk.Frame(p, bg=DUSK2, highlightbackground=RUFOUS,
                          highlightthickness=1)
         share.pack(fill="x", pady=(0, 12))
@@ -1939,6 +2007,13 @@ class App(tk.Tk):
                     self.w_send_btn.configure(state="normal")
                     self._w_say(f"Could not send: {rest[0]}", RED)
                     self.toast("Could not send — see the Wallet tab.", "bad")
+                elif kind == "repaired":
+                    ok, msg = rest
+                    self.toast(msg, "good" if ok else "info")
+                    self.log(msg, "good" if ok else None)
+                    self._tick_now()
+                elif kind == "status":
+                    self.status_var.set(rest[0])
                 elif kind == "toast":
                     self.toast(*rest)
                 elif kind == "connfail":
@@ -2208,6 +2283,26 @@ class App(tk.Tk):
                          daemon=True).start()
 
     def _mine_loop(self, address, threads):
+        # Never start building blocks before we know whether anyone else is
+        # out there. At the starting difficulty a few seconds of solo mining
+        # can outweigh the real network, and once that happens this node
+        # correctly refuses to switch — leaving it mining a private chain
+        # forever with no way back except deleting the ledger by hand. So
+        # wait for the answer first.
+        if self.node.network_state() == "looking":
+            self.q.put(("status", "Finding the network before mining…"))
+            self.log("Checking for other nodes before mining, so this "
+                     "computer can't start a chain of its own by mistake…")
+            state = self.node.wait_until_known(timeout=45)
+            if not self.mining.is_set():
+                return
+            if state == "joined":
+                self.log("Connected. Mining on the shared chain.", "good")
+            else:
+                self.log("No other nodes answered — mining a brand-new "
+                         "network on this machine. It will merge with the "
+                         "others automatically when one appears.", "warn")
+
         self.log(f"Mining on {threads} CPU thread(s). Every block found "
                  f"pays the reward to {address[:14]}…", "hi")
         while self.mining.is_set():
