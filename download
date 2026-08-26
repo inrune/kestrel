@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+kestrel-data/
+kestrel-wallet.json
+*-settings.json
+node*/
+.DS_Store
