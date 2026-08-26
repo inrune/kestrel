@@ -8,7 +8,7 @@ from .wallet import Wallet, format_ksl, parse_ksl
 from .miner import mine, mine_block, find_pow, default_threads
 from .node import Node
 
-__version__ = "1.4.3"
+__version__ = "1.4.4"
 __all__ = [
     "params", "Blockchain", "ValidationError", "Block", "build_genesis",
     "Transaction", "TxInput", "TxOutput", "Wallet", "format_ksl",
