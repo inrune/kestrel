@@ -36,7 +36,7 @@ for cand in (_HERE, os.path.abspath(os.path.join(_HERE, "..", ".."))):
 
 from kestrel import params, __version__ as KVER             # noqa: E402
 from kestrel.blockchain import Blockchain, ValidationError   # noqa: E402
-from kestrel.wallet import Wallet, format_ksl                # noqa: E402
+from kestrel.wallet import Wallet, format_ksl, parse_ksl    # noqa: E402
 from kestrel.crypto_utils import is_valid_address, private_to_wif  # noqa: E402
 from kestrel.miner import assemble_candidate, find_pow, default_threads  # noqa: E402
 from kestrel.node import Node                                # noqa: E402
@@ -522,8 +522,9 @@ class Toasts:
 
 
 class App(tk.Tk):
-    VIEWS = ("Mine", "Explorer", "Network", "Activity")
-    ICONS = {"Mine": "⚒", "Explorer": "◎", "Network": "⇄", "Activity": "≣"}
+    VIEWS = ("Mine", "Wallet", "Explorer", "Network", "Activity")
+    ICONS = {"Mine": "⚒", "Wallet": "◈", "Explorer": "◎", "Network": "⇄",
+             "Activity": "≣"}
 
     def __init__(self):
         super().__init__()
@@ -931,6 +932,7 @@ class App(tk.Tk):
         content.rowconfigure(0, weight=1); content.columnconfigure(0, weight=1)
         self._views = {}
         for name, builder in (("Mine", self._view_mine),
+                              ("Wallet", self._view_wallet),
                               ("Explorer", self._view_explorer),
                               ("Network", self._view_network),
                               ("Activity", self._view_activity)):
@@ -1926,6 +1928,17 @@ class App(tk.Tk):
                         int(self.settings.get("lifetime_blocks", 0)) + 1
                     save_settings(self.settings)
                     self._paint_lifetime()
+                elif kind == "wsent":
+                    self.w_send_btn.configure(state="normal")
+                    self._w_say(f"✓ Sent {rest[0]} — the next block "
+                                f"confirms it, about 2 minutes.", GREEN)
+                    self.toast(f"✓ Sent {rest[0]}.", "good")
+                    self.w_to.delete(0, "end"); self.w_amt.delete(0, "end")
+                    self._refresh_wallet()
+                elif kind == "wfail":
+                    self.w_send_btn.configure(state="normal")
+                    self._w_say(f"Could not send: {rest[0]}", RED)
+                    self.toast("Could not send — see the Wallet tab.", "bad")
                 elif kind == "toast":
                     self.toast(*rest)
                 elif kind == "connfail":
@@ -2247,8 +2260,279 @@ class App(tk.Tk):
         self.q.put(("rate", 0.0))
         self.log("Mining stopped.")
 
+    # ---------------------------------------------------------------- wallet
+    def _view_wallet(self, f):
+        p = self._page(f, "Wallet",
+                       "Spend what you mine — your keys stay on this "
+                       "machine and every transaction is signed here")
+
+        chips = tk.Frame(p, bg=DUSK); chips.pack(fill="x", pady=(0, 14))
+        self.chip_w_spend = self._chip(chips, "SPENDABLE NOW")
+        self.chip_w_conf = self._chip(chips, "CONFIRMED")
+        self.chip_w_imm = self._chip(chips, "MATURING")
+
+        # ---- receive -----------------------------------------------------
+        recv = tk.Frame(p, bg=DUSK2, highlightbackground=RUFOUS,
+                        highlightthickness=1)
+        recv.pack(fill="x", pady=(0, 12))
+        rc = tk.Frame(recv, bg=DUSK2); rc.pack(fill="x", padx=18, pady=12)
+        tk.Label(rc, text="YOUR ADDRESS — share it to get paid",
+                 bg=DUSK2, fg=RUFOUS_HI, font=TINY_B).pack(anchor="w")
+        rrow = tk.Frame(rc, bg=DUSK2); rrow.pack(fill="x", pady=(6, 0))
+        self.w_addr_var = tk.StringVar(value="…")
+        al = tk.Label(rrow, textvariable=self.w_addr_var, bg=SPOT, fg=BUFF,
+                      font=MONO_13, anchor="w", padx=12, pady=9,
+                      cursor="hand2")
+        al.pack(side="left", fill="x", expand=True)
+        al.bind("<Button-1>", lambda _e: self._w_copy_addr())
+        Tooltip(al, "Click to copy")
+        self._btn(rrow, "Copy", self._w_copy_addr, primary=True,
+                  tip="Copy your address").pack(side="left", padx=(8, 0))
+        self._btn(rrow, "Back up key", self._w_backup,
+                  tip="Show the secret key that restores this wallet.\n"
+                      "Anyone who has it can spend your coins."
+                  ).pack(side="left", padx=(6, 0))
+
+        # ---- send --------------------------------------------------------
+        send = tk.Frame(p, bg=DUSK2); send.pack(fill="x", pady=(0, 12))
+        sc = tk.Frame(send, bg=DUSK2); sc.pack(fill="x", padx=18, pady=14)
+        tk.Label(sc, text="SEND KSL", bg=DUSK2, fg=MUTED,
+                 font=TINY_B).pack(anchor="w")
+
+        r1 = tk.Frame(sc, bg=DUSK2); r1.pack(fill="x", pady=(8, 0))
+        tk.Label(r1, text="To", bg=DUSK2, fg=MUTED, font=SANS_9,
+                 width=7, anchor="w").pack(side="left")
+        self.w_to = tk.Entry(r1, bg=SPOT, fg=BUFF, insertbackground=BUFF,
+                             relief="flat", font=MONO_9)
+        self.w_to.pack(side="left", fill="x", expand=True, ipady=6, ipadx=8)
+
+        r2 = tk.Frame(sc, bg=DUSK2); r2.pack(fill="x", pady=(7, 0))
+        tk.Label(r2, text="Amount", bg=DUSK2, fg=MUTED, font=SANS_9,
+                 width=7, anchor="w").pack(side="left")
+        self.w_amt = tk.Entry(r2, bg=SPOT, fg=BUFF, insertbackground=BUFF,
+                              relief="flat", font=MONO_9, width=18)
+        self.w_amt.pack(side="left", ipady=6, ipadx=8)
+        tk.Label(r2, text="KSL", bg=DUSK2, fg=FAINT,
+                 font=SANS_9).pack(side="left", padx=(7, 0))
+        self._btn(r2, "Send all", self._w_send_all,
+                  tip="Fill in everything you can spend, minus the fee"
+                  ).pack(side="left", padx=(10, 0))
+
+        r3 = tk.Frame(sc, bg=DUSK2); r3.pack(fill="x", pady=(7, 0))
+        tk.Label(r3, text="Fee", bg=DUSK2, fg=MUTED, font=SANS_9,
+                 width=7, anchor="w").pack(side="left")
+        self.w_fee = tk.Entry(r3, bg=SPOT, fg=BUFF, insertbackground=BUFF,
+                              relief="flat", font=MONO_9, width=18)
+        self.w_fee.pack(side="left", ipady=6, ipadx=8)
+        self.w_fee.insert(0, format_ksl(params.MIN_RELAY_FEE).split()[0])
+        tk.Label(r3, text="KSL  ·  paid to whoever mines your transaction",
+                 bg=DUSK2, fg=FAINT, font=TINY).pack(side="left", padx=(7, 0))
+
+        r4 = tk.Frame(sc, bg=DUSK2); r4.pack(fill="x", pady=(12, 0))
+        self.w_send_btn = self._btn(r4, "Review and send", self._w_send,
+                                    primary=True,
+                                    tip="You'll get a confirmation prompt "
+                                        "before anything is sent")
+        self.w_send_btn.pack(side="left")
+        self.w_note = tk.StringVar(value="")
+        self.w_note_l = tk.Label(sc, textvariable=self.w_note, bg=DUSK2,
+                                 fg=MUTED, font=SANS_9, wraplength=640,
+                                 justify="left", anchor="w")
+        self.w_note_l.pack(anchor="w", pady=(9, 0))
+
+        # ---- history -----------------------------------------------------
+        tk.Label(p, text="YOUR TRANSACTIONS", bg=DUSK, fg=MUTED,
+                 font=TINY_B).pack(anchor="w", pady=(6, 6))
+        wrap, self.w_tx = self._tree(
+            p, (("When", 150, "w"), ("Kind", 96, "w"),
+                ("Amount", 150, "e"), ("Status", 170, "w")),
+            height=9, stretch="Status")
+        wrap.pack(fill="both", expand=True)
+
+    def _w_wallet(self):
+        """The wallet this app owns the keys for, if any."""
+        try:
+            if os.path.exists(WALLET_FILE):
+                return Wallet.load(WALLET_FILE)
+        except Exception:
+            pass
+        return None
+
+    def _w_copy_addr(self):
+        a = self.w_addr_var.get()
+        if a and a != "…":
+            self._copy_text(a, "Address copied.")
+
+    def _w_backup(self):
+        w = self._w_wallet()
+        if not w:
+            messagebox.showinfo(
+                "No key here",
+                "This app is mining to an address you pasted in, so it "
+                "doesn't hold that key — whichever wallet created the "
+                "address has it.")
+            return
+        messagebox.showinfo(
+            "Your backup key",
+            "Address:\n" + w.address +
+            "\n\nBackup key (keep secret):\n" +
+            private_to_wif(w.private_key) +
+            "\n\nWrite this down and keep it offline. It is the only way "
+            "to restore your coins, and anyone who has it can spend them.")
+
+    def _w_say(self, msg, colour=None):
+        self.w_note.set(msg)
+        self.w_note_l.configure(fg=colour or MUTED)
+
+    def _w_send_all(self):
+        w = self._w_wallet()
+        if not w:
+            return
+        with self.lock:
+            bal = self.chain.balance(w.address)
+        try:
+            fee = parse_ksl(self.w_fee.get())
+        except ValueError:
+            fee = params.MIN_RELAY_FEE
+        amount = bal["spendable"] - fee
+        if amount <= 0:
+            self._w_say("There isn't enough spendable KSL to cover the fee "
+                        "yet. Freshly mined coins need 10 confirmations.",
+                        RED)
+            return
+        self.w_amt.delete(0, "end")
+        self.w_amt.insert(0, format_ksl(amount).split()[0])
+
+    def _w_send(self):
+        w = self._w_wallet()
+        if not w:
+            messagebox.showinfo(
+                "This app can't spend that address",
+                "You're mining to an address that was made elsewhere, so "
+                "the key isn't here. Open Kestrel Wallet to spend from it.")
+            return
+        to = self.w_to.get().strip()
+        if not is_valid_address(to):
+            self._w_say("That doesn't look like a Kestrel address — they "
+                        "start with K.", RED)
+            return
+        if to == w.address:
+            self._w_say("That's your own address.", RED)
+            return
+        try:
+            amount = parse_ksl(self.w_amt.get())
+        except ValueError as e:
+            self._w_say(f"Amount: {e}", RED); return
+        try:
+            fee = parse_ksl(self.w_fee.get())
+        except ValueError as e:
+            self._w_say(f"Fee: {e}", RED); return
+        if amount <= 0:
+            self._w_say("Enter an amount greater than zero.", RED); return
+        if fee < params.MIN_RELAY_FEE:
+            self._w_say(f"The fee must be at least "
+                        f"{format_ksl(params.MIN_RELAY_FEE)}.", RED)
+            return
+        with self.lock:
+            bal = self.chain.balance(w.address)
+        if amount + fee > bal["spendable"]:
+            self._w_say(
+                f"You can spend {format_ksl(bal['spendable'])} right now. "
+                f"Newly mined blocks need 10 confirmations before they can "
+                f"be spent.", RED)
+            return
+        if not messagebox.askyesno(
+                "Send KSL?",
+                f"Send {format_ksl(amount)}\n"
+                f"to {to}\n\n"
+                f"Fee: {format_ksl(fee)}\n"
+                f"Total: {format_ksl(amount + fee)}\n\n"
+                "This cannot be undone. Check the address carefully."):
+            return
+        self.w_send_btn.configure(state="disabled")
+        self._w_say("Signing and broadcasting…")
+        threading.Thread(target=self._w_send_worker,
+                         args=(w, to, amount, fee), daemon=True).start()
+
+    def _w_send_worker(self, w, to, amount, fee):
+        try:
+            with self.lock:
+                utxos = self.chain.utxos_for(w.address, spendable_only=True)
+                tx = w.build_transaction(utxos, to, amount, fee)
+                self.chain.add_transaction(tx)
+                self.chain.save()
+            self.node.broadcast("/tx", {"tx": tx.to_dict()})
+            self.q.put(("wsent", format_ksl(amount)))
+        except ValidationError as e:
+            self.q.put(("wfail", str(e)))
+        except Exception as e:
+            self.q.put(("wfail", str(e)))
+
     # --------------------------------------------------------------- stats
+    def _refresh_wallet(self):
+        """Balances, address and history for the Wallet tab."""
+        if not hasattr(self, "w_addr_var"):
+            return
+        # Show the address this app holds the key for — that is the one it
+        # can actually spend from. Mining rewards may be pointed somewhere
+        # else entirely (a pasted address), so say so rather than showing a
+        # balance for one address and spending from another.
+        own = self._w_wallet()
+        payout = self.addr_e.get().strip()
+        addr = own.address if own else payout
+        if not is_valid_address(addr):
+            return
+        self.w_addr_var.set(addr)
+        if own and is_valid_address(payout) and payout != own.address:
+            self._w_say("Note: mining rewards are going to a different "
+                        "address you pasted in, not this one.")
+        with self.lock:
+            bal = self.chain.balance(addr)
+            height = self.chain.height
+            rows, mem_rows = [], []
+            for b in reversed(self.chain.blocks[-400:]):
+                for tx in b.transactions:
+                    got = sum(o.amount for o in tx.outputs
+                              if o.address == addr)
+                    if not got:
+                        continue
+                    confs = height - b.height + 1
+                    if tx.is_coinbase:
+                        kind = "Mined"
+                        status = ("spendable" if confs >= params.COINBASE_MATURITY
+                                  else f"matures in "
+                                       f"{params.COINBASE_MATURITY - confs} blocks")
+                    else:
+                        kind = "Received"
+                        status = f"{confs} confirmation(s)"
+                    rows.append((time.strftime("%d %b, %H:%M",
+                                               time.localtime(b.timestamp)),
+                                 kind,
+                                 format_ksl(got), status))
+                    if len(rows) >= 60:
+                        break
+                if len(rows) >= 60:
+                    break
+            for tx in self.chain.mempool.values():
+                got = sum(o.amount for o in tx.outputs if o.address == addr)
+                if got:
+                    mem_rows.append(("pending", "Incoming",
+                                     format_ksl(got), "waiting for a block"))
+        self.chip_w_spend.set(format_ksl(bal["spendable"]))
+        self.chip_w_conf.set(format_ksl(bal["confirmed"]))
+        self.chip_w_imm.set(format_ksl(bal["confirmed"] - bal["spendable"]))
+        tv = self.w_tx
+        tv.delete(*tv.get_children())
+        for r in mem_rows + rows:
+            tv.insert("", "end", values=r,
+                      tags=("dim",) if r[0] == "pending" else ())
+        self._hint_if_empty(tv, "Nothing yet — mine a block to get paid.")
+
     def _refresh_stats(self):
+        try:
+            self._refresh_wallet()
+        except Exception:
+            pass          # wallet tab is cosmetic; never break the miner
         addr = self.addr_e.get().strip()
         with self.lock:
             h = self.chain.height
