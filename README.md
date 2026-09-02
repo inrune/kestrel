@@ -168,7 +168,77 @@ closely.
 
 ---
 
+## Supporting the project
+
+Kestrel has no company, no funding and no token sale. If it is useful to
+you, KSL sent here pays for the seed node and the time that goes into it.
+Entirely optional — running a node helps just as much.
+
+```
+KTBXt1vWME9FznuXZ77QMconqg5rk5qDVM
+```
+
+The website shows the same address and tells readers to check it against
+this file before sending anything. That cross-check is the point: a
+website can be tampered with, and two independent sources are harder to
+change at once than one. If the two ever disagree, trust neither and open
+an issue.
+
 ## Changelog
+
+### v1.4.7 — announcements, custom dialogs, and a fork-heal that doesn't expire
+
+**Every dialog is now the app's own.** All 28 `messagebox` calls across the
+Miner and Wallet drew a native OS box — grey, system font, ignoring the
+theme completely. They now use a styled modal built on the existing
+`_dialog`/`_present_dialog` helpers: a severity-coloured spine, the app's
+own type and palette, Escape and the window button both answering "no",
+and Return confirming. Links inside a dialog are shown as selectable
+read-only text and are never opened for you.
+
+The native *file* picker is deliberately kept. People expect their own
+bookmarks and recent folders when saving a wallet backup, and a
+hand-rolled file browser would be worse in every way that matters.
+
+**Announcements moved to the top of the window.** They were a strip along
+the bottom, where the update bar and status line already live; a third
+strip down there reads as chrome and gets ignored. The strip now sits
+directly under the title bar with a spine coloured by level (slate, amber,
+red), a label line carrying the level and date, and a `+n more` count when
+several are waiting.
+
+**Announcements.** The Miner and Wallet now read `announcements.txt` from
+this repo and show new entries in a bar at the bottom of the window. Edit
+that file here on GitHub and save — that is the whole publishing process.
+Apps check on launch and every 25 minutes after that. Turn it off under
+**Settings → Show announcements from the project**; with it off nothing is
+fetched at all, so the choice removes the request and not merely the
+message. Dismissed entries never come back, and there is a menu item to
+un-dismiss them all.
+
+The feed is treated as untrusted input, because anyone who can edit this
+repo can put text in front of every user. Only `http(s)` links survive
+parsing, links are printed rather than opened, control characters are
+stripped and every field is length-capped. Each message carries a fixed
+reminder that Kestrel will never ask for your wallet file or key.
+
+**Fixed: fork healing stopped working after ~69 days.** `gossip_block` is
+the only mechanism that can repair a fork with a peer that cannot be
+dialled — which is most home miners, behind NAT. It pushed the entire
+chain, and gave up outright once the chain passed `MAX_PUSH_BLOCKS`:
+
+    if self.chain.height > MAX_PUSH_BLOCKS:   # 50,000
+        return
+
+At two-minute blocks that ceiling arrives after about 69 days, after which
+two diverged nodes mine in parallel forever with nothing able to reconcile
+them. Pushes now carry only the recent 2,000-block suffix plus the height
+it starts at, and the receiver splices it onto its own already-validated
+prefix. `from` must be a height the receiver holds and can never be `0`,
+so the genesis block stays unreplaceable. Omitting `from` keeps the old
+whole-chain behaviour, so upgraded and older nodes still interoperate.
+
+Tests: 87 → 113.
 
 ### v1.4.6 — no more accidental private chains
 
