@@ -34,7 +34,8 @@ for cand in (_HERE, os.path.abspath(os.path.join(_HERE, "..", ".."))):
         sys.path.insert(0, cand)
         break
 
-from kestrel import params, updates, __version__ as KVER    # noqa: E402
+from kestrel import (params, updates, announcements,        # noqa: E402
+                     __version__ as KVER)
 from kestrel.blockchain import Blockchain, ValidationError   # noqa: E402
 from kestrel.wallet import Wallet, format_ksl, parse_ksl    # noqa: E402
 from kestrel.crypto_utils import is_valid_address, private_to_wif  # noqa: E402
@@ -59,7 +60,7 @@ def _enable_dpi():
 _enable_dpi()
 
 import tkinter as tk                                         # noqa: E402
-from tkinter import ttk, messagebox, filedialog              # noqa: E402
+from tkinter import ttk, filedialog                          # noqa: E402
 from tkinter import font as tkfont                           # noqa: E402
 
 DATA_DIR = os.path.join(_HERE, "kestrel-data")
@@ -68,6 +69,12 @@ SETTINGS_FILE = os.path.join(_HERE, "miner-settings.json")
 PORTS = tuple(params.DEFAULT_PORT + i for i in range(10))
 
 # ------------------------------------------------------------------ palette
+# How often a running app re-checks the announcement feed. It also checks
+# once on startup, so this only governs long-lived sessions. Kept modest:
+# it is a small text file on a CDN, and 25 minutes is roughly 58 requests
+# a day per app.
+ANNOUNCE_EVERY_MS = 25 * 60 * 1000
+
 DUSK, DUSK2, DUSK3, SPOT = "#1B212C", "#222A38", "#2A3444", "#10141B"
 RAIL = "#141924"
 BUFF, MUTED, FAINT = "#EAE1CE", "#A79F8D", "#736c5e"
@@ -720,6 +727,79 @@ class App(tk.Tk):
         if modal:
             top.grab_set()
 
+    # --------------------------------------------------------------- dialogs
+
+    def _modal(self, title, message, kind="info", ok="OK", cancel=None,
+               link=None):
+        """The app's own dialog, in place of a native OS message box.
+
+        Returns True when the primary button is chosen and False
+        otherwise, so it can stand in for both showinfo and askyesno.
+        Escape and the window close button both count as False — the safe
+        answer for a confirmation, and harmless for a plain notice.
+
+        A `link` is shown as selectable read-only text. Nothing here ever
+        opens a browser on the reader's behalf.
+        """
+        accent = {"info": SLATE, "good": GREEN, "warn": AMBER,
+                  "error": RED}.get(kind, SLATE)
+        out = {"ok": False}
+
+        top = self._dialog(title)
+        tk.Frame(top, bg=accent, height=3).pack(fill="x")
+        body = tk.Frame(top, bg=DUSK2, padx=24, pady=20)
+        body.pack(fill="both", expand=True)
+
+        tk.Label(body, text=title, bg=DUSK2, fg=BUFF, font=SANS_B,
+                 anchor="w", justify="left", wraplength=440).pack(fill="x")
+        tk.Label(body, text=message, bg=DUSK2, fg=MUTED, font=SANS,
+                 anchor="w", justify="left", wraplength=440
+                 ).pack(fill="x", pady=(9, 0))
+
+        if link:
+            e = tk.Entry(body, bg=DUSK3, fg=SLATE, font=MONO_9, relief="flat",
+                         bd=0, readonlybackground=DUSK3, highlightthickness=0)
+            e.insert(0, link)
+            e.configure(state="readonly")
+            e.pack(fill="x", pady=(13, 0), ipady=7)
+
+        row = tk.Frame(body, bg=DUSK2)
+        row.pack(fill="x", pady=(20, 0))
+
+        def done(v):
+            out["ok"] = v
+            top.destroy()
+
+        primary = self._btn(row, ok, lambda: done(True), primary=True)
+        primary.pack(side="right")
+        if cancel:
+            self._btn(row, cancel, lambda: done(False)).pack(side="right",
+                                                             padx=(0, 8))
+        top.protocol("WM_DELETE_WINDOW", lambda: done(False))
+        top.bind("<Escape>", lambda _e: done(False))
+        top.bind("<Return>", lambda _e: done(True))
+        self._present_dialog(top)
+        primary.focus_set()
+        self.wait_window(top)
+        return out["ok"]
+
+    def _say(self, title, message, kind="info", link=None):
+        """Styled stand-in for the old messagebox.showinfo."""
+        return self._modal(title, message, kind=kind, link=link)
+
+    def _error(self, title, message):
+        """Styled stand-in for the old messagebox.showerror."""
+        return self._modal(title, message, kind="error")
+
+    def _warn(self, title, message):
+        """Styled stand-in for the old messagebox.showwarning."""
+        return self._modal(title, message, kind="warn")
+
+    def _ask(self, title, message):
+        """Styled stand-in for the old messagebox.askyesno."""
+        return self._modal(title, message, kind="warn", ok="Continue",
+                           cancel="Cancel")
+
     def _btn(self, parent, text, cmd, primary=False, tip=None, **kw):
         base = RUFOUS if primary else DUSK3
         hov = RUFOUS_HI if primary else HOVER
@@ -832,6 +912,16 @@ class App(tk.Tk):
         fm.add_separator()
         fm.add_command(label="Exit", command=self._quit)
         bar.add_cascade(label="File", menu=fm)
+        sm = tk.Menu(bar, tearoff=0, **mk)
+        self.announce_var = tk.BooleanVar(
+            value=bool(self.settings.get("announcements", True)))
+        sm.add_checkbutton(label="Show announcements from the project",
+                           variable=self.announce_var,
+                           onvalue=True, offvalue=False,
+                           command=self._save_announcements_pref)
+        sm.add_command(label="Forget dismissed announcements",
+                       command=self._reset_announcements)
+        bar.add_cascade(label="Settings", menu=sm)
         hm = tk.Menu(bar, tearoff=0, **mk)
         hm.add_command(label="About Kestrel Miner", command=self._about)
         hm.add_command(label="Keyboard shortcuts", command=self._shortcuts)
@@ -846,14 +936,14 @@ class App(tk.Tk):
         self.config(menu=bar)
 
     def _about(self):
-        messagebox.showinfo(
+        self._say(
             "About",
             f"Kestrel Miner {KVER}\n\nScrypt proof-of-work miner for Kestrel "
             "(KSL) with a full node built in.\nEvery block found pays the "
             "block reward to your address.\n\nOpen source, MIT license.")
 
     def _shortcuts(self):
-        messagebox.showinfo(
+        self._say(
             "Keyboard shortcuts",
             "Ctrl+1…4   switch view (Mine / Explorer / Network / Activity)\n"
             "Ctrl+M      start / stop mining\n"
@@ -863,7 +953,7 @@ class App(tk.Tk):
 
     def _backup_key(self):
         if not os.path.exists(WALLET_FILE):
-            return messagebox.showinfo("No address yet",
+            return self._say("No address yet",
                                        "Create a reward address first.")
         path = filedialog.asksaveasfilename(
             title="Backup reward key", defaultextension=".json",
@@ -875,7 +965,7 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------------- UI
     def _build_ui(self):
-        body = tk.Frame(self, bg=DUSK)
+        body = self.body_frame = tk.Frame(self, bg=DUSK)
         body.pack(fill="both", expand=True)
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
@@ -956,6 +1046,38 @@ class App(tk.Tk):
                   ).pack(side="right", padx=(0, 6), pady=4)
         # deliberately not packed — shown only by _offer_update
 
+        # Announcements from the project. This sits directly under the
+        # title bar rather than at the foot of the window: the bottom edge
+        # already carries the update strip and the status line, and a
+        # third strip down there reads as chrome and gets ignored.
+        self.note_bar = tk.Frame(self, bg=DUSK2)
+        self.note_spine = tk.Frame(self.note_bar, bg=SLATE, width=3)
+        self.note_spine.pack(side="left", fill="y")
+
+        acts = tk.Frame(self.note_bar, bg=DUSK2)
+        acts.pack(side="right", padx=14, pady=9)
+        self._btn(acts, "Read", self._read_note, primary=True,
+                  tip="Show the full message").pack(side="right")
+        self._btn(acts, "Dismiss", self._dismiss_note,
+                  tip="Hide this announcement for good"
+                  ).pack(side="right", padx=(0, 8))
+        self.note_more = tk.Label(acts, text="", bg=DUSK2, fg=FAINT,
+                                  font=SANS_9)
+        self.note_more.pack(side="right", padx=(0, 12))
+
+        inner = tk.Frame(self.note_bar, bg=DUSK2)
+        inner.pack(side="left", fill="both", expand=True, padx=14, pady=9)
+        self.note_kind = tk.StringVar(value="ANNOUNCEMENT")
+        self.note_kind_lbl = tk.Label(inner, textvariable=self.note_kind,
+                                      bg=DUSK2, fg=SLATE, font=SANS_9B,
+                                      anchor="w")
+        self.note_kind_lbl.pack(fill="x")
+        self.note_msg = tk.StringVar(value="")
+        tk.Label(inner, textvariable=self.note_msg, bg=DUSK2, fg=BUFF,
+                 font=SANS, anchor="w", justify="left"
+                 ).pack(fill="x", pady=(2, 0))
+        # deliberately not packed — shown only by _render_note
+
         sb = tk.Frame(self, bg=SPOT)
         sb.pack(fill="x", side="bottom")
         self.status_var = tk.StringVar()
@@ -975,6 +1097,7 @@ class App(tk.Tk):
                  pady=5).pack(side="left", fill="x", expand=True)
         self.show_view("Mine")
         updates.check(self._offer_update)
+        self._check_announcements()
 
     def _open_releases(self):
         import webbrowser
@@ -989,16 +1112,131 @@ class App(tk.Tk):
             self.update_bar.pack(fill="x", side="bottom")
         self.after(0, show)
 
+    # ------------------------------------------------------ announcements
+
+    def _check_announcements(self):
+        """Ask GitHub for project announcements, unless the user said no.
+
+        Runs once at startup and every ANNOUNCE_EVERY_MS after that.
+
+        With the setting off nothing is fetched at all — the choice turns
+        the network request off, not merely the display of its result.
+
+        Three places call this: startup, switching the setting back on,
+        and un-dismissing. Each would otherwise start its own repeating
+        timer, so flipping the setting a few times would leave several
+        chains running and multiply the polling rate. Cancelling first
+        keeps exactly one alive no matter how it was reached.
+        """
+        job = getattr(self, "_note_job", None)
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
+            self._note_job = None
+        if not self.settings.get("announcements", True):
+            return
+        seen = self.settings.get("announcements_seen", [])
+        announcements.check(self._on_announcements, seen)
+        self._note_job = self.after(ANNOUNCE_EVERY_MS,
+                                    self._check_announcements)
+
+    def _on_announcements(self, items):
+        """Called from a background thread, only when something is new."""
+        self.after(0, lambda: self._show_announcements(items))
+
+    def _show_announcements(self, items):
+        if not items or not self.settings.get("announcements", True):
+            return
+        self._notes = list(items)
+        self._render_note()
+
+    def _render_note(self):
+        """Show the first unread announcement in the strip below the header."""
+        item = self._notes[0]
+        accent = {"urgent": RED, "important": AMBER}.get(item["level"], SLATE)
+        label = {"urgent": "URGENT", "important": "IMPORTANT"}.get(
+            item["level"], "ANNOUNCEMENT")
+        if item["date"]:
+            label += "     " + item["date"]
+
+        self.note_kind.set(label)
+        self.note_spine.configure(bg=accent)
+        self.note_kind_lbl.configure(fg=accent)
+
+        text = " ".join((item["title"] or item["body"]).split())
+        self.note_msg.set(text if len(text) <= 96 else text[:96].rstrip() + "…")
+
+        waiting = len(self._notes) - 1
+        self.note_more.configure(text=f"+{waiting} more" if waiting else "")
+
+        # `before` pins it above the main body no matter when it appears
+        self.note_bar.pack(fill="x", side="top", before=self.body_frame)
+
+    def _read_note(self):
+        """Show the full text of the current announcement.
+
+        The link is printed rather than opened, so the reader sees where
+        it goes before deciding. This text comes from a file on the
+        internet: it is displayed as a message and can do nothing else.
+        """
+        if not getattr(self, "_notes", None):
+            return
+        item = self._notes[0]
+        body = item["body"] or item["title"]
+        if item["date"]:
+            body = item["date"] + "\n\n" + body
+        if item["link"]:
+            body += "\n\nLink: " + item["link"]
+        body += ("\n\nKestrel will never ask for your wallet file, your "
+                 "backup key or your password. Any message that does is not "
+                 "from the project.")
+        self._say(item["title"] or "Announcement", body,
+                  kind={"urgent": "error", "important": "warn"}.get(
+                      item["level"], "info"),
+                  link=item["link"] or None)
+
+    def _dismiss_note(self):
+        """Hide this one for good, then show the next if there is one."""
+        notes = getattr(self, "_notes", [])
+        if notes:
+            seen = list(self.settings.get("announcements_seen", []))
+            seen.append(notes[0]["id"])
+            self.settings["announcements_seen"] = seen[-200:]   # bounded
+            save_settings(self.settings)
+            self._notes = notes[1:]
+        if getattr(self, "_notes", None):
+            self._render_note()
+        else:
+            self.note_bar.pack_forget()
+
+    def _save_announcements_pref(self):
+        on = bool(self.announce_var.get())
+        self.settings["announcements"] = on
+        save_settings(self.settings)
+        if on:
+            self._check_announcements()
+        else:
+            self.note_bar.pack_forget()
+            self.toast("Announcements turned off.", "info")
+
+    def _reset_announcements(self):
+        self.settings["announcements_seen"] = []
+        save_settings(self.settings)
+        self.toast("Dismissed announcements will appear again.", "info")
+        self._check_announcements()
+
     def _repair_chain(self):
         """Rebuild the ledger from the network, so nobody ever has to go
         and delete their chain file by hand to get unstuck."""
         if self.mining.is_set():
-            messagebox.showinfo(
+            self._say(
                 "Stop mining first",
                 "Stop mining before rebuilding, so the repair isn't racing "
                 "against new blocks.")
             return
-        if not messagebox.askyesno(
+        if not self._ask(
                 "Rebuild from the network?",
                 "This downloads the chain from the other nodes and switches "
                 "to it if theirs is better than yours.\n\n"
@@ -1844,7 +2082,7 @@ class App(tk.Tk):
         if not fw_rule_present(self.node.port):
             return self.toast("There's no Kestrel firewall rule to remove.",
                               "info")
-        if not messagebox.askyesno(
+        if not self._ask(
                 "Remove firewall rule?",
                 "Remove the Windows Firewall rule that lets friends connect "
                 f"to this app on TCP port {self.node.port}?\n\n"
@@ -2019,7 +2257,7 @@ class App(tk.Tk):
                 elif kind == "connfail":
                     title, msg = rest
                     self.toast("Couldn't connect — see the details.", "bad")
-                    messagebox.showwarning(title, msg)
+                    self._warn(title, msg)
                 elif kind == "fixdone":
                     self._finish_fix(rest[0])
                 elif kind == "stats":
@@ -2166,7 +2404,7 @@ class App(tk.Tk):
         w.save(WALLET_FILE)
         self._set_address(w.address)
         self.log("Created your reward address automatically.", "good")
-        messagebox.showinfo(
+        self._say(
             "Your reward address is ready",
             "Address:\n" + w.address +
             "\n\nBackup key (keep secret):\n" + private_to_wif(w.private_key) +
@@ -2176,7 +2414,7 @@ class App(tk.Tk):
             "different address? Just paste it in the address box.")
 
     def make_address(self):
-        if os.path.exists(WALLET_FILE) and not messagebox.askyesno(
+        if os.path.exists(WALLET_FILE) and not self._ask(
                 "Replace address?",
                 "An address already exists here and will be replaced. "
                 "If it holds KSL, use File ▸ Backup first.\n\nContinue?"):
@@ -2184,7 +2422,7 @@ class App(tk.Tk):
         w = Wallet.create()
         w.save(WALLET_FILE)
         self._set_address(w.address)
-        messagebox.showinfo(
+        self._say(
             "Back up your key",
             "Your new address:\n" + w.address +
             "\n\nYour backup key:\n" + private_to_wif(w.private_key) +
@@ -2257,7 +2495,7 @@ class App(tk.Tk):
         address = self.addr_e.get().strip()
         if not is_valid_address(address):
             self.show_view("Mine")
-            return messagebox.showerror(
+            return self._error(
                 "Where should rewards go?",
                 "Paste a Kestrel address (starts with K) or press "
                 "“Mine to my wallet” — your rewards need "
@@ -2461,13 +2699,13 @@ class App(tk.Tk):
     def _w_backup(self):
         w = self._w_wallet()
         if not w:
-            messagebox.showinfo(
+            self._say(
                 "No key here",
                 "This app is mining to an address you pasted in, so it "
                 "doesn't hold that key — whichever wallet created the "
                 "address has it.")
             return
-        messagebox.showinfo(
+        self._say(
             "Your backup key",
             "Address:\n" + w.address +
             "\n\nBackup key (keep secret):\n" +
@@ -2501,7 +2739,7 @@ class App(tk.Tk):
     def _w_send(self):
         w = self._w_wallet()
         if not w:
-            messagebox.showinfo(
+            self._say(
                 "This app can't spend that address",
                 "You're mining to an address that was made elsewhere, so "
                 "the key isn't here. Open Kestrel Wallet to spend from it.")
@@ -2536,7 +2774,7 @@ class App(tk.Tk):
                 f"Newly mined blocks need 10 confirmations before they can "
                 f"be spent.", RED)
             return
-        if not messagebox.askyesno(
+        if not self._ask(
                 "Send KSL?",
                 f"Send {format_ksl(amount)}\n"
                 f"to {to}\n\n"
@@ -2759,7 +2997,7 @@ class App(tk.Tk):
         self._zebra(self.peers_tv)
 
     def _quit(self):
-        if self.mining.is_set() and not messagebox.askyesno(
+        if self.mining.is_set() and not self._ask(
                 "Stop mining and quit?",
                 "Mining is running. Quit anyway?\n\n"
                 "Blocks already found are safe — they are on the chain."):
