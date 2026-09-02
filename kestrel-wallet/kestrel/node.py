@@ -76,7 +76,8 @@ MAX_PEERS = 40
 MAX_FAILS = 6          # consecutive failures before a non-seed peer is dropped
 NEW_PEER_FAILS = 3     # ...but a peer that NEVER answered is dropped sooner
 SYNC_WORKERS = 8       # parallel peer connections (dead peers can't stall us)
-MAX_PUSH_BLOCKS = 50_000    # cap on a chain pushed to us via POST /chain
+MAX_PUSH_BLOCKS = 50_000    # cap on blocks accepted in one POST /chain
+PUSH_WINDOW = 2_000         # how far back a fork-heal push reaches
 ALONE_AFTER_ATTEMPTS = 4    # sync rounds with no answer before we accept
                             # that this really is a network of one
 REMAP_INTERVAL = 15 * 60    # re-ask the router for the port (renew/reboot)
@@ -331,9 +332,13 @@ class Node:
                 return
             with self.lock:
                 ours = self.chain.total_work()
-                if self.chain.height > MAX_PUSH_BLOCKS:
-                    return
-                blocks = [b.to_dict() for b in self.chain.blocks]
+                # Send the recent suffix rather than the entire chain, and
+                # tell them where it starts. Pushing every block from
+                # genesis meant this healing path switched itself off once
+                # the chain outgrew MAX_PUSH_BLOCKS, stranding exactly the
+                # NAT'd peers it exists to rescue.
+                start = max(1, self.chain.height - PUSH_WINDOW + 1)
+                blocks = [b.to_dict() for b in self.chain.blocks[start:]]
             try:
                 theirs = int(got.get("total_work", 0))
             except (TypeError, ValueError):
@@ -341,8 +346,8 @@ class Node:
             if theirs >= ours:
                 return          # they're heavier — sync_once will pull
             try:
-                self._http_json("POST", peer + "/chain", {"blocks": blocks},
-                                timeout=60)
+                self._http_json("POST", peer + "/chain",
+                                {"blocks": blocks, "from": start}, timeout=60)
             except Exception:
                 pass
 
@@ -1229,7 +1234,22 @@ class Node:
                                               400)
                         if len(blocks) > MAX_PUSH_BLOCKS:
                             return self._send({"error": "too many blocks"}, 400)
+                        try:
+                            start = int(body.get("from", 0) or 0)
+                        except (TypeError, ValueError):
+                            return self._send({"error": "bad from"}, 400)
                         with node.lock:
+                            if start:
+                                # A suffix: rebuild the full candidate from
+                                # our own prefix. start must be a height we
+                                # actually hold, and never 0 — the genesis
+                                # block is not replaceable.
+                                if not 1 <= start <= c.height:
+                                    return self._send(
+                                        {"error": "from out of range",
+                                         "height": c.height}, 409)
+                                blocks = ([b.to_dict()
+                                           for b in c.blocks[:start]] + blocks)
                             took = c.maybe_replace(blocks)
                             height = c.height
                             tip = c.tip

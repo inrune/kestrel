@@ -34,7 +34,7 @@ for cand in (_HERE, os.path.abspath(os.path.join(_HERE, "..", ".."))):
         sys.path.insert(0, cand)
         break
 
-from kestrel import params, __version__ as KVER              # noqa: E402
+from kestrel import params, announcements, __version__ as KVER  # noqa: E402
 from kestrel.wallet import Wallet, format_ksl, parse_ksl      # noqa: E402
 from kestrel.crypto_utils import is_valid_address, private_to_wif  # noqa: E402
 from kestrel.blockchain import Blockchain, ValidationError    # noqa: E402
@@ -58,7 +58,7 @@ def _enable_dpi():
 _enable_dpi()
 
 import tkinter as tk                                          # noqa: E402
-from tkinter import ttk, messagebox, filedialog               # noqa: E402
+from tkinter import ttk, filedialog                           # noqa: E402
 from tkinter import font as tkfont                            # noqa: E402
 
 WALLET_FILE = os.path.join(_HERE, "kestrel-wallet.json")
@@ -629,6 +629,13 @@ class Toasts:
             y -= max(f.winfo_reqheight(), 36) + 8
 
 
+
+# How often a running app re-checks the announcement feed. It also checks
+# once on startup, so this only governs long-lived sessions. Kept modest:
+# it is a small text file on a CDN, and 25 minutes is roughly 58 requests
+# a day per app.
+ANNOUNCE_EVERY_MS = 25 * 60 * 1000
+
 class App(tk.Tk):
     VIEWS = ("Overview", "Send", "Receive", "Transactions", "Contacts")
     ICONS = {"Overview": "◈", "Send": "↑", "Receive": "↓",
@@ -718,13 +725,13 @@ class App(tk.Tk):
             try:
                 self.wallet = Wallet.load(WALLET_FILE)
             except Exception as e:
-                messagebox.showerror("Wallet file problem", str(e))
+                self._error("Wallet file problem", str(e))
         else:
             self.wallet = Wallet.create()
             self.wallet.save(WALLET_FILE)
             self.settings["backed_up"] = False
             save_settings(self.settings)
-            messagebox.showinfo(
+            self._say(
                 "Welcome to Kestrel",
                 "Your wallet is ready.\n\nAddress (share to receive):\n"
                 + self.wallet.address +
@@ -886,6 +893,79 @@ class App(tk.Tk):
         top.wait_window()
         return out["value"]
 
+    # --------------------------------------------------------------- dialogs
+
+    def _modal(self, title, message, kind="info", ok="OK", cancel=None,
+               link=None):
+        """The app's own dialog, in place of a native OS message box.
+
+        Returns True when the primary button is chosen and False
+        otherwise, so it can stand in for both showinfo and askyesno.
+        Escape and the window close button both count as False — the safe
+        answer for a confirmation, and harmless for a plain notice.
+
+        A `link` is shown as selectable read-only text. Nothing here ever
+        opens a browser on the reader's behalf.
+        """
+        accent = {"info": SLATE, "good": GREEN, "warn": AMBER,
+                  "error": RED}.get(kind, SLATE)
+        out = {"ok": False}
+
+        top = self._dialog(title)
+        tk.Frame(top, bg=accent, height=3).pack(fill="x")
+        body = tk.Frame(top, bg=DUSK2, padx=24, pady=20)
+        body.pack(fill="both", expand=True)
+
+        tk.Label(body, text=title, bg=DUSK2, fg=BUFF, font=SANS_B,
+                 anchor="w", justify="left", wraplength=440).pack(fill="x")
+        tk.Label(body, text=message, bg=DUSK2, fg=MUTED, font=SANS,
+                 anchor="w", justify="left", wraplength=440
+                 ).pack(fill="x", pady=(9, 0))
+
+        if link:
+            e = tk.Entry(body, bg=DUSK3, fg=SLATE, font=MONO_9, relief="flat",
+                         bd=0, readonlybackground=DUSK3, highlightthickness=0)
+            e.insert(0, link)
+            e.configure(state="readonly")
+            e.pack(fill="x", pady=(13, 0), ipady=7)
+
+        row = tk.Frame(body, bg=DUSK2)
+        row.pack(fill="x", pady=(20, 0))
+
+        def done(v):
+            out["ok"] = v
+            top.destroy()
+
+        primary = self._btn(row, ok, lambda: done(True), primary=True)
+        primary.pack(side="right")
+        if cancel:
+            self._btn(row, cancel, lambda: done(False)).pack(side="right",
+                                                             padx=(0, 8))
+        top.protocol("WM_DELETE_WINDOW", lambda: done(False))
+        top.bind("<Escape>", lambda _e: done(False))
+        top.bind("<Return>", lambda _e: done(True))
+        self._present_dialog(top)
+        primary.focus_set()
+        self.wait_window(top)
+        return out["ok"]
+
+    def _say(self, title, message, kind="info", link=None):
+        """Styled stand-in for the old messagebox.showinfo."""
+        return self._modal(title, message, kind=kind, link=link)
+
+    def _error(self, title, message):
+        """Styled stand-in for the old messagebox.showerror."""
+        return self._modal(title, message, kind="error")
+
+    def _warn(self, title, message):
+        """Styled stand-in for the old messagebox.showwarning."""
+        return self._modal(title, message, kind="warn")
+
+    def _ask(self, title, message):
+        """Styled stand-in for the old messagebox.askyesno."""
+        return self._modal(title, message, kind="warn", ok="Continue",
+                           cancel="Cancel")
+
     def _btn(self, parent, text, cmd, primary=False, tip=None, **kw):
         base = RUFOUS if primary else DUSK3
         hov = RUFOUS_HI if primary else HOVER
@@ -1015,6 +1095,15 @@ class App(tk.Tk):
         sm.add_separator()
         sm.add_command(label="Open node dashboard in browser",
                        command=self._open_dashboard)
+        sm.add_separator()
+        self.announce_var = tk.BooleanVar(
+            value=bool(self.settings.get("announcements", True)))
+        sm.add_checkbutton(label="Show announcements from the project",
+                           variable=self.announce_var,
+                           onvalue=True, offvalue=False,
+                           command=self._save_announcements_pref)
+        sm.add_command(label="Forget dismissed announcements",
+                       command=self._reset_announcements)
         bar.add_cascade(label="Settings", menu=sm)
         hm = tk.Menu(bar, tearoff=0, **mk)
         hm.add_command(label="About Kestrel Wallet", command=self._about)
@@ -1129,8 +1218,123 @@ class App(tk.Tk):
         self._btn(row, "Close", top.destroy).pack(side="left", padx=4)
         self._present_dialog(top, modal=False)
 
+    # ------------------------------------------------------ announcements
+
+    def _check_announcements(self):
+        """Ask GitHub for project announcements, unless the user said no.
+
+        Runs once at startup and every ANNOUNCE_EVERY_MS after that.
+
+        With the setting off nothing is fetched at all — the choice turns
+        the network request off, not merely the display of its result.
+
+        Three places call this: startup, switching the setting back on,
+        and un-dismissing. Each would otherwise start its own repeating
+        timer, so flipping the setting a few times would leave several
+        chains running and multiply the polling rate. Cancelling first
+        keeps exactly one alive no matter how it was reached.
+        """
+        job = getattr(self, "_note_job", None)
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
+            self._note_job = None
+        if not self.settings.get("announcements", True):
+            return
+        seen = self.settings.get("announcements_seen", [])
+        announcements.check(self._on_announcements, seen)
+        self._note_job = self.after(ANNOUNCE_EVERY_MS,
+                                    self._check_announcements)
+
+    def _on_announcements(self, items):
+        """Called from a background thread, only when something is new."""
+        self.after(0, lambda: self._show_announcements(items))
+
+    def _show_announcements(self, items):
+        if not items or not self.settings.get("announcements", True):
+            return
+        self._notes = list(items)
+        self._render_note()
+
+    def _render_note(self):
+        """Show the first unread announcement in the strip below the header."""
+        item = self._notes[0]
+        accent = {"urgent": RED, "important": AMBER}.get(item["level"], SLATE)
+        label = {"urgent": "URGENT", "important": "IMPORTANT"}.get(
+            item["level"], "ANNOUNCEMENT")
+        if item["date"]:
+            label += "     " + item["date"]
+
+        self.note_kind.set(label)
+        self.note_spine.configure(bg=accent)
+        self.note_kind_lbl.configure(fg=accent)
+
+        text = " ".join((item["title"] or item["body"]).split())
+        self.note_msg.set(text if len(text) <= 96 else text[:96].rstrip() + "…")
+
+        waiting = len(self._notes) - 1
+        self.note_more.configure(text=f"+{waiting} more" if waiting else "")
+
+        # `before` pins it above the main body no matter when it appears
+        self.note_bar.pack(fill="x", side="top", before=self.body_frame)
+
+    def _read_note(self):
+        """Show the full text of the current announcement.
+
+        The link is printed rather than opened, so the reader sees where
+        it goes before deciding. This text comes from a file on the
+        internet: it is displayed as a message and can do nothing else.
+        """
+        if not getattr(self, "_notes", None):
+            return
+        item = self._notes[0]
+        body = item["body"] or item["title"]
+        if item["date"]:
+            body = item["date"] + "\n\n" + body
+        if item["link"]:
+            body += "\n\nLink: " + item["link"]
+        body += ("\n\nKestrel will never ask for your wallet file, your "
+                 "backup key or your password. Any message that does is not "
+                 "from the project.")
+        self._say(item["title"] or "Announcement", body,
+                  kind={"urgent": "error", "important": "warn"}.get(
+                      item["level"], "info"),
+                  link=item["link"] or None)
+
+    def _dismiss_note(self):
+        """Hide this one for good, then show the next if there is one."""
+        notes = getattr(self, "_notes", [])
+        if notes:
+            seen = list(self.settings.get("announcements_seen", []))
+            seen.append(notes[0]["id"])
+            self.settings["announcements_seen"] = seen[-200:]   # bounded
+            save_settings(self.settings)
+            self._notes = notes[1:]
+        if getattr(self, "_notes", None):
+            self._render_note()
+        else:
+            self.note_bar.pack_forget()
+
+    def _save_announcements_pref(self):
+        on = bool(self.announce_var.get())
+        self.settings["announcements"] = on
+        save_settings(self.settings)
+        if on:
+            self._check_announcements()
+        else:
+            self.note_bar.pack_forget()
+            self.toast("Announcements turned off.", "info")
+
+    def _reset_announcements(self):
+        self.settings["announcements_seen"] = []
+        save_settings(self.settings)
+        self.toast("Dismissed announcements will appear again.", "info")
+        self._check_announcements()
+
     def _about(self):
-        messagebox.showinfo(
+        self._say(
             "About",
             f"Kestrel Wallet {KVER}\n\nSelf-custody wallet for Kestrel (KSL) "
             "— fixed supply of 44,000,000, secured by proof-of-work.\n\n"
@@ -1138,7 +1342,7 @@ class App(tk.Tk):
             "Open source, MIT license.")
 
     def _shortcuts(self):
-        messagebox.showinfo(
+        self._say(
             "Keyboard shortcuts",
             "Ctrl+1…5   switch view (Overview / Send / Receive / "
             "Transactions / Contacts)\n"
@@ -1149,7 +1353,7 @@ class App(tk.Tk):
 
     def _backup_wallet(self):
         if not os.path.exists(WALLET_FILE):
-            return messagebox.showinfo("No wallet", "Create a wallet first.")
+            return self._say("No wallet", "Create a wallet first.")
         path = filedialog.asksaveasfilename(
             title="Backup wallet file", defaultextension=".json",
             initialfile="kestrel-wallet-backup.json",
@@ -1166,7 +1370,7 @@ class App(tk.Tk):
     def _build_ui(self):
         self.addr_var = tk.StringVar(value="…")
 
-        body = tk.Frame(self, bg=DUSK)
+        body = self.body_frame = tk.Frame(self, bg=DUSK)
         body.pack(fill="both", expand=True)
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
@@ -1248,7 +1452,40 @@ class App(tk.Tk):
             f.grid(row=0, column=0, sticky="nsew")
             builder(f)
             self._views[name] = f
+
+        # Announcements from the project. This sits directly under the
+        # title bar rather than at the foot of the window: the bottom edge
+        # already carries the update strip and the status line, and a
+        # third strip down there reads as chrome and gets ignored.
+        self.note_bar = tk.Frame(self, bg=DUSK2)
+        self.note_spine = tk.Frame(self.note_bar, bg=SLATE, width=3)
+        self.note_spine.pack(side="left", fill="y")
+
+        acts = tk.Frame(self.note_bar, bg=DUSK2)
+        acts.pack(side="right", padx=14, pady=9)
+        self._btn(acts, "Read", self._read_note, primary=True,
+                  tip="Show the full message").pack(side="right")
+        self._btn(acts, "Dismiss", self._dismiss_note,
+                  tip="Hide this announcement for good"
+                  ).pack(side="right", padx=(0, 8))
+        self.note_more = tk.Label(acts, text="", bg=DUSK2, fg=FAINT,
+                                  font=SANS_9)
+        self.note_more.pack(side="right", padx=(0, 12))
+
+        inner = tk.Frame(self.note_bar, bg=DUSK2)
+        inner.pack(side="left", fill="both", expand=True, padx=14, pady=9)
+        self.note_kind = tk.StringVar(value="ANNOUNCEMENT")
+        self.note_kind_lbl = tk.Label(inner, textvariable=self.note_kind,
+                                      bg=DUSK2, fg=SLATE, font=SANS_9B,
+                                      anchor="w")
+        self.note_kind_lbl.pack(fill="x")
+        self.note_msg = tk.StringVar(value="")
+        tk.Label(inner, textvariable=self.note_msg, bg=DUSK2, fg=BUFF,
+                 font=SANS, anchor="w", justify="left"
+                 ).pack(fill="x", pady=(2, 0))
+        # deliberately not packed — shown only by _render_note
         self.show_view("Overview")
+        self._check_announcements()
 
     def show_view(self, name):
         self._active_view = name
@@ -1856,7 +2093,7 @@ class App(tk.Tk):
 
     def _book_del(self):
         v = self._book_sel()
-        if v and v[1] in self.book and messagebox.askyesno(
+        if v and v[1] in self.book and self._ask(
                 "Delete contact?", f"Remove “{v[0]}” from Contacts?"):
             del self.book[v[1]]
             self._save_book(); self._paint_book()
@@ -1909,7 +2146,7 @@ class App(tk.Tk):
                 elif kind == "connfail":
                     title, msg = rest
                     self.toast("Couldn't connect — see the details.", "bad")
-                    messagebox.showwarning(title, msg)
+                    self._warn(title, msg)
                 elif kind == "sharedlg":
                     self._show_share_dialog(*rest)
                 elif kind == "refresh":
@@ -1951,7 +2188,7 @@ class App(tk.Tk):
 
     # -------------------------------------------------------------- wallet
     def new_wallet(self):
-        if self.wallet and not messagebox.askyesno(
+        if self.wallet and not self._ask(
                 "Replace wallet?",
                 "A wallet already exists here. Creating a new one replaces "
                 "it in this app.\n\nIf the old one holds KSL, use File ▸ "
@@ -1965,7 +2202,7 @@ class App(tk.Tk):
         self._update_banner()
         self._draw_qr()
         self.show_view("Receive")
-        messagebox.showinfo(
+        self._say(
             "Back up your key",
             "Your new address:\n" + self.wallet.address +
             "\n\nNow use File ▸ Backup (or Show backup key) and store it "
@@ -1990,11 +2227,11 @@ class App(tk.Tk):
             self.toast("Wallet restored — balance loads in a moment.",
                        "good")
         except Exception as e:
-            messagebox.showerror("Restore failed", str(e))
+            self._error("Restore failed", str(e))
 
     def show_wif(self):
         if not self.wallet:
-            return messagebox.showinfo("No wallet", "Create a wallet first.")
+            return self._say("No wallet", "Create a wallet first.")
         top = self._dialog("Your backup key — keep it secret")
         tk.Label(top, text="Write this down. Anyone with it can spend your "
                  "KSL,\nand it is the only way to restore your wallet.",
@@ -2216,7 +2453,7 @@ class App(tk.Tk):
 
     def send(self):
         if not self.wallet:
-            return messagebox.showinfo("No wallet",
+            return self._say("No wallet",
                                        "Create a wallet first (File menu).")
         if not self._validate_send():
             return
