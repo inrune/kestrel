@@ -1,38 +1,11 @@
-# Kestrel announcements
-# ---------------------------------------------------------------------
-# The Miner and Wallet read this file and show new entries to people
-# running them. Edit it right here on GitHub and save — that is the whole
-# publishing process. Apps check on launch and every 25 minutes after that.
-#
-# Format
-#   Entries are separated by a line of three dashes:  ---
-#   Each entry is  key: value  lines. Indent a line to continue the one
-#   above it. Lines starting with # are ignored.
-#
-#   id     unique, and NEVER reuse one. Dismissing an entry remembers this
-#          id, so reusing it means people never see the new message.
-#          Leave it out and an id is derived from the text instead.
-#   date   shown to the reader. Free text; YYYY-MM-DD reads best.
-#   level  info | important | urgent.  Anything above info gets a warning
-#          mark. Save it for things that genuinely matter, or it stops
-#          meaning anything.
-#   title  one line. This is what shows in the bar, so make it stand alone.
-#   body   the full message. Shown when the reader clicks Read.
-#   link   optional, must start with http:// or https://. It is printed
-#          for the reader to see, never opened automatically.
-#
-# Keep it short. Every entry interrupts somebody who was doing something
-# else. If there is nothing worth saying, leave this file with no entries.
-#
-# NEVER ask anyone for a wallet file, backup key, private key or password
-# here. The apps tell readers the project will never do that, so any
-# message that does is treated as an attack — including one from you.
-# ---------------------------------------------------------------------
+---
 
-id: 2026-09-welcome
-date: 2026-09-02
+id: 2026-09-telegram-group
+date: 2026-09-03
 level: info
-title: Welcome to Kestrel
-body: The network is live and open to anyone. If you have not backed up
-  your wallet file yet, do it now — there is no way to recover it later.
-link: https://github.com/inrune/kestrel
+title: Kestrel now has a community chat
+body: A Telegram group for people running Kestrel — a place to ask
+  questions, trade tips on mining setups, and talk to others on the
+  network. Not run by anyone claiming special access to your wallet:
+  nobody there will ever ask for your key or your wallet file.
+link: https://t.me/+m72FpLnBhag0YzRk
