@@ -1,11 +1,9 @@
 ---
 
-id: 2026-09-telegram-group
-date: 2026-09-03
+id: 2026-09-kestrel-v1-4-8-beta
+date: 2026-09-17
 level: info
-title: Kestrel now has a community chat
-body: A Telegram group for people running Kestrel — a place to ask
-  questions, trade tips on mining setups, and talk to others on the
-  network. Not run by anyone claiming special access to your wallet:
-  nobody there will ever ask for your key or your wallet file.
-link: https://t.me/+m72FpLnBhag0YzRk
+title: Kestrel v1.4.8 beta coming soon
+body: Kestrel v1.4.8 beta is coming soon. More details and release
+information will be announced shortly.
+--------------------------------------
