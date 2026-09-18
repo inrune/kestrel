@@ -34,13 +34,15 @@ for cand in (_HERE, os.path.abspath(os.path.join(_HERE, "..", ".."))):
         sys.path.insert(0, cand)
         break
 
-from kestrel import (params, updates, announcements,        # noqa: E402
+from kestrel import (params, updates, announcements, ui,   # noqa: E402
                      __version__ as KVER)
-from kestrel.blockchain import Blockchain, ValidationError   # noqa: E402
+from kestrel.blockchain import (Blockchain, ValidationError,  # noqa: E402
+                                MEMPOOL_TTL)
 from kestrel.wallet import Wallet, format_ksl, parse_ksl    # noqa: E402
 from kestrel.crypto_utils import is_valid_address, private_to_wif  # noqa: E402
 from kestrel.miner import assemble_candidate, find_pow, default_threads  # noqa: E402
 from kestrel.node import Node                                # noqa: E402
+from kestrel import logfile                                   # noqa: E402
 from kestrel.discovery import get_lan_ip                     # noqa: E402
 
 
@@ -68,86 +70,47 @@ WALLET_FILE = os.path.join(_HERE, "kestrel-wallet.json")
 SETTINGS_FILE = os.path.join(_HERE, "miner-settings.json")
 PORTS = tuple(params.DEFAULT_PORT + i for i in range(10))
 
-# ------------------------------------------------------------------ palette
 # How often a running app re-checks the announcement feed. It also checks
-# once on startup, so this only governs long-lived sessions. Kept modest:
-# it is a small text file on a CDN, and 25 minutes is roughly 58 requests
-# a day per app.
+# once on startup, so this only governs long-lived sessions.
 ANNOUNCE_EVERY_MS = 25 * 60 * 1000
 
-DUSK, DUSK2, DUSK3, SPOT = "#1B212C", "#222A38", "#2A3444", "#10141B"
-RAIL = "#141924"
-BUFF, MUTED, FAINT = "#EAE1CE", "#A79F8D", "#736c5e"
-RUFOUS, RUFOUS_HI = "#C4552A", "#DB6636"
-GREEN, RED, SLATE = "#5FA46A", "#C15b4b", "#8CA7C4"
-AMBER = "#D9A441"
-ZEBRA = "#131822"
-HOVER = "#33405A"
-GRID = "#202836"
+# When an unconfirmed payment stops being normal and starts being news.
+# Kestrel aims at a block every two minutes, so a few of those is "slow"
+# and twenty of them means no miner is taking it.
+SLOW_AFTER = 6 * 60
+STUCK_AFTER = 40 * 60
 
-# Fonts are resolved per-platform once a Tk root exists (see _resolve_fonts).
-SANS = ("Segoe UI", 10)
-SANS_B = ("Segoe UI", 10, "bold")
-SANS_9 = ("Segoe UI", 9)
-SANS_9B = ("Segoe UI", 9, "bold")
-TINY = ("Segoe UI", 8)
-TINY_B = ("Segoe UI", 8, "bold")
-MICRO_B = ("Segoe UI", 7, "bold")
-TITLE = ("Segoe UI", 16, "bold")
-BRAND = ("Segoe UI", 14, "bold")
-BIGBTN = ("Segoe UI", 12, "bold")
-MONO = ("Consolas", 10)
-MONO_9 = ("Consolas", 9)
-MONO_8 = ("Consolas", 8)
-MONO_7 = ("Consolas", 7)
-MONO_13 = ("Consolas", 13)
-MONO_15B = ("Consolas", 15, "bold")
-MONO_20B = ("Consolas", 20, "bold")
+# ------------------------------------------------------------------ theme
+# Palette, type scale and widgets live in kestrel/ui.py, shared with the
+# Wallet. The names below are local shorthands for it, nothing more.
+DUSK, DUSK2, DUSK3, SPOT = ui.SURFACE, ui.CARD, ui.CARD_HI, ui.SUNK
+RAIL, INK = ui.RAIL, ui.INK
+BUFF, MUTED, FAINT = ui.TEXT, ui.TEXT_DIM, ui.TEXT_FAINT
+RUFOUS, RUFOUS_HI = ui.RUFOUS, ui.RUFOUS_HI
+GREEN, RED, SLATE = ui.GREEN, ui.RED, ui.SLATE
+AMBER, ZEBRA, HOVER = ui.AMBER, ui.ZEBRA, ui.FOCUS
+GRID, LINE, LINE_SOFT = ui.LINE, ui.LINE, ui.LINE_SOFT
+
+SANS = SANS_B = SANS_9 = SANS_9B = TINY = TINY_B = MICRO_B = ("", 10)
+TITLE = BRAND = BIGBTN = MONO = MONO_9 = MONO_8 = MONO_7 = ("", 10)
+MONO_13 = MONO_15B = MONO_20B = LEAD = H2 = H3 = ("", 10)
 
 
-def _resolve_fonts(root):
-    """Pick the best available family per platform and rebuild font tuples."""
+def _resolve_fonts(root, scale=1.0):
+    """Resolve the shared type scale, then republish it under local names."""
     global SANS, SANS_B, SANS_9, SANS_9B, TINY, TINY_B, MICRO_B, TITLE
     global BRAND, BIGBTN, MONO, MONO_9, MONO_8, MONO_7, MONO_13
-    global MONO_15B, MONO_20B
-    try:
-        fams = set(tkfont.families(root))
-    except Exception:
-        return
-    sans = next((f for f in ("Segoe UI", "SF Pro Text", "Helvetica Neue",
-                             "DejaVu Sans", "Arial") if f in fams),
-                "TkDefaultFont")
-    mono = next((f for f in ("Cascadia Mono", "Consolas", "SF Mono", "Menlo",
-                             "DejaVu Sans Mono", "Courier New") if f in fams),
-                "TkFixedFont")
-    SANS = (sans, 10)
-    SANS_B = (sans, 10, "bold")
-    SANS_9 = (sans, 9)
-    SANS_9B = (sans, 9, "bold")
-    TINY = (sans, 8)
-    TINY_B = (sans, 8, "bold")
-    MICRO_B = (sans, 7, "bold")
-    TITLE = (sans, 16, "bold")
-    BRAND = (sans, 14, "bold")
-    BIGBTN = (sans, 12, "bold")
-    MONO = (mono, 10)
-    MONO_9 = (mono, 9)
-    MONO_8 = (mono, 8)
-    MONO_7 = (mono, 7)
-    MONO_13 = (mono, 13)
-    MONO_15B = (mono, 15, "bold")
-    MONO_20B = (mono, 20, "bold")
-
-
-# ------------------------------------------------------------------ helpers
-def port_free(p):
-    s = socket.socket()
-    try:
-        s.bind(("127.0.0.1", p)); return True
-    except OSError:
-        return False
-    finally:
-        s.close()
+    global MONO_15B, MONO_20B, LEAD, H2, H3
+    F = ui.resolve_fonts(root, scale)
+    SANS, SANS_B = F["body"], F["body_b"]
+    SANS_9, SANS_9B = F["small"], F["small_b"]
+    TINY, TINY_B, MICRO_B = F["tiny"], F["tiny_b"], F["micro"]
+    TITLE, BRAND, LEAD = F["h1"], F["brand"], F["lead"]
+    H2, H3, BIGBTN = F["h2"], F["h3"], F["h3"]
+    MONO, MONO_9, MONO_8, MONO_7 = (F["mono"], F["mono_small"],
+                                    F["mono_tiny"], F["mono_micro"])
+    MONO_13, MONO_15B, MONO_20B = (F["mono_lead_b"], F["mono_big"],
+                                   F["mono_huge"])
 
 
 def load_settings() -> dict:
@@ -164,6 +127,16 @@ def save_settings(d: dict):
             json.dump(d, fh, indent=2)
     except Exception:
         pass
+
+
+def port_free(p):
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", p)); return True
+    except OSError:
+        return False
+    finally:
+        s.close()
 
 
 def fmt_rate(r: float) -> str:
@@ -437,104 +410,20 @@ def fw_apply(add: bool, port: int) -> tuple:
             "The rule is still present.")
 
 
-class Tooltip:
-    """Small hover hint for any widget."""
-
-    def __init__(self, widget, text, delay=550):
-        self.w, self.text, self.delay = widget, text, delay
-        self.tip = None
-        self._id = None
-        widget.bind("<Enter>", self._schedule, add="+")
-        widget.bind("<Leave>", self._hide, add="+")
-        widget.bind("<ButtonPress>", self._hide, add="+")
-
-    def _schedule(self, _e=None):
-        self._cancel()
-        self._id = self.w.after(self.delay, self._show)
-
-    def _cancel(self):
-        if self._id:
-            self.w.after_cancel(self._id)
-            self._id = None
-
-    def _show(self):
-        if self.tip or not self.text:
-            return
-        x = self.w.winfo_rootx() + 12
-        y = self.w.winfo_rooty() + self.w.winfo_height() + 6
-        self.tip = tk.Toplevel(self.w)
-        self.tip.wm_overrideredirect(True)
-        self.tip.wm_geometry(f"+{x}+{y}")
-        f = tk.Frame(self.tip, bg=DUSK3)
-        f.pack()
-        tk.Label(f, text=self.text, bg="#0C0F14", fg=BUFF,
-                 font=SANS_9, justify="left", relief="flat",
-                 padx=10, pady=6, wraplength=320).pack(padx=1, pady=1)
-        try:
-            self.tip.attributes("-topmost", True)
-        except Exception:
-            pass
-
-    def _hide(self, _e=None):
-        self._cancel()
-        if self.tip:
-            self.tip.destroy()
-            self.tip = None
+Tooltip = ui.Tooltip
+Toasts = ui.Toasts
 
 
-class Toasts:
-    """Non-blocking notifications, bottom-right, click to dismiss."""
-
-    def __init__(self, root):
-        self.root = root
-        self.items = []
-
-    def show(self, text, kind="info", ms=4500):
-        edge = {"good": GREEN, "bad": RED, "warn": AMBER}.get(kind, SLATE)
-        f = tk.Frame(self.root, bg=SPOT, highlightbackground=edge,
-                     highlightthickness=1)
-        tk.Frame(f, bg=edge, width=3).pack(side="left", fill="y")
-        tk.Label(f, text=text, bg=SPOT, fg=BUFF, font=SANS_9, padx=12,
-                 pady=8, wraplength=380, justify="left").pack(side="left")
-        x = tk.Label(f, text="✕", bg=SPOT, fg=FAINT, font=TINY, padx=8,
-                     cursor="hand2")
-        x.pack(side="right", fill="y")
-        for w in (f, x):
-            w.bind("<Button-1>", lambda _e, ff=f: self.close(ff))
-        self.items.append(f)
-        self._layout()
-        self.root.after(ms, lambda: self.close(f))
-
-    def close(self, f):
-        if f in self.items:
-            self.items.remove(f)
-        try:
-            f.destroy()
-        except Exception:
-            pass
-        self._layout()
-
-    def _layout(self):
-        while len(self.items) > 4:
-            self.close(self.items[0])
-        try:
-            self.root.update_idletasks()
-        except Exception:
-            pass
-        y = -44
-        for f in reversed(self.items):
-            f.place(relx=1.0, rely=1.0, x=-14, y=y, anchor="se")
-            f.lift()
-            y -= max(f.winfo_reqheight(), 36) + 8
-
-
-class App(tk.Tk):
+class App(ui.Resilient, tk.Tk):
     VIEWS = ("Mine", "Wallet", "Explorer", "Network", "Activity")
     ICONS = {"Mine": "⚒", "Wallet": "◈", "Explorer": "◎", "Network": "⇄",
              "Activity": "≣"}
 
     def __init__(self):
         super().__init__()
+        # Diagnostics go to kestrel-log.txt beside the app, and the
+        # console stays clean — see kestrel/logfile.py.
+        logfile.setup(_HERE, "miner", quiet=True)
         _resolve_fonts(self)
         self.title(f"Kestrel Miner {KVER}")
         self.configure(bg=DUSK)
@@ -569,13 +458,13 @@ class App(tk.Tk):
 
         self._init_style()
         self._build_menu()
+        self._update_rel = None       # a newer release, once known
         self._build_ui()
         self._bind_keys()
         self._ensure_address()
         self._refresh_stats()
-        self.after(150, self._drain_queue)
+        self._start_loops()
         self.after(400, self.start_node)       # auto-run the node on launch
-        self.after(3000, self._tick)           # periodic stats + peer table
         if self.settings.get("autostart"):
             self.after(2500, self._autostart)
         self.protocol("WM_DELETE_WINDOW", self._quit)
@@ -599,10 +488,17 @@ class App(tk.Tk):
             self.geometry("1000x680")
 
     def _make_icon(self):
+        """The real Kestrel mark in the title bar and the taskbar.
+
+        Falls back to the hand-drawn shape if Tk cannot take a PNG, so a
+        cosmetic feature can never stop the app opening.
+        """
+        self._icon_img = ui.app_icon(self)
+        if self._icon_img:
+            return
         try:
             img = tk.PhotoImage(width=32, height=32)
             img.put(DUSK2, to=(0, 0, 32, 32))
-            # a simple kestrel mark: rufous peak with a buff eye
             for y in range(5, 26):
                 w = int((y - 5) * 0.62) + 1
                 img.put(RUFOUS, to=(16 - w, y, 16 + w, y + 1))
@@ -630,20 +526,7 @@ class App(tk.Tk):
 
     # -------------------------------------------------------------- theming
     def _init_style(self):
-        s = ttk.Style(self)
-        s.theme_use("clam")
-        s.configure("KV.Treeview", background=SPOT, fieldbackground=SPOT,
-                    foreground=BUFF, bordercolor=DUSK3, borderwidth=0,
-                    rowheight=27, font=SANS_9)
-        s.configure("KV.Treeview.Heading", background=DUSK3, foreground=MUTED,
-                    font=TINY_B, relief="flat", padding=6)
-        s.map("KV.Treeview", background=[("selected", DUSK3)],
-              foreground=[("selected", BUFF)])
-        s.map("KV.Treeview.Heading", background=[("active", HOVER)])
-        s.configure("KV.Vertical.TScrollbar", background=DUSK3,
-                    troughcolor=SPOT, bordercolor=SPOT, arrowcolor=MUTED,
-                    relief="flat", gripcount=0)
-        s.map("KV.Vertical.TScrollbar", background=[("active", HOVER)])
+        ui.init_style(self)
 
     def _attach_edit_menu(self, w):
         """Right-click Cut/Copy/Paste/Select-all on an Entry + Ctrl+A."""
@@ -671,11 +554,8 @@ class App(tk.Tk):
                lambda e: (w.select_range(0, "end"), "break")[1])
         return w
 
-    def _entry(self, parent, **kw):
-        e = tk.Entry(parent, bg=SPOT, fg=BUFF, insertbackground=BUFF,
-                     relief="flat", font=MONO, highlightthickness=1,
-                     highlightbackground=DUSK3, highlightcolor=SLATE, **kw)
-        return self._attach_edit_menu(e)
+    def _entry(self, parent, f="mono", **kw):
+        return self._attach_edit_menu(ui.entry(parent, f=f, **kw))
 
     def _placeholder(self, e, text):
         """Grey hint text inside an Entry that clears itself on focus."""
@@ -801,102 +681,23 @@ class App(tk.Tk):
                            cancel="Cancel")
 
     def _btn(self, parent, text, cmd, primary=False, tip=None, **kw):
-        base = RUFOUS if primary else DUSK3
-        hov = RUFOUS_HI if primary else HOVER
-        b = tk.Button(parent, text=text, command=cmd, bg=base,
-                      fg=DUSK if primary else BUFF,
-                      activebackground=hov,
-                      activeforeground=DUSK if primary else BUFF,
-                      relief="flat", font=SANS_B, padx=15, pady=7,
-                      cursor="hand2", bd=0, **kw)
-        b.bind("<Enter>", lambda _e: b.configure(
-            bg=hov if b["state"] != "disabled" else base), add="+")
-        b.bind("<Leave>", lambda _e: b.configure(bg=base), add="+")
-        if tip:
-            Tooltip(b, tip)
-        return b
+        return ui.button(parent, text, cmd,
+                         kind="primary" if primary else "normal",
+                         tip=tip, **kw)
 
-    def _linkbtn(self, parent, text, cmd, tip=None):
-        b = tk.Button(parent, text=text, command=cmd, bg=DUSK, fg=SLATE,
-                      activebackground=DUSK, activeforeground=BUFF,
-                      relief="flat", font=SANS_9B, padx=6, pady=2,
-                      cursor="hand2", bd=0)
-        b.bind("<Enter>", lambda _e: b.configure(fg=BUFF), add="+")
-        b.bind("<Leave>", lambda _e: b.configure(fg=SLATE), add="+")
-        if tip:
-            Tooltip(b, tip)
-        return b
+    def _linkbtn(self, parent, text, cmd, tip=None, bg=None):
+        return ui.link(parent, text, cmd, bg=bg or DUSK, tip=tip)
 
     def _zebra(self, tv):
-        for i, iid in enumerate(tv.get_children()):
-            tags = [t for t in tv.item(iid, "tags")
-                    if t not in ("even", "odd")]
-            tags.append("even" if i % 2 == 0 else "odd")
-            tv.item(iid, tags=tags)
-
-    def _style_table(self, tv):
-        """Zebra colors, hint style and click-to-sort headings."""
-        tv.tag_configure("even", background=SPOT)
-        tv.tag_configure("odd", background=ZEBRA)
-        tv.tag_configure("hint", foreground=FAINT)
-
-        def sortkey(v):
-            s = (str(v).replace(",", "").replace("+", "")
-                 .replace(" KSL", "").replace("…", "").strip())
-            try:
-                return (0, float(s), "")
-            except ValueError:
-                return (1, 0.0, s.lower())
-
-        def sort(col, rev):
-            rows = [(tv.set(i, col), i) for i in tv.get_children()]
-            rows.sort(key=lambda t: sortkey(t[0]), reverse=rev)
-            for pos, (_v, i) in enumerate(rows):
-                tv.move(i, "", pos)
-            tv.heading(col, command=lambda c=col: sort(c, not rev))
-            self._zebra(tv)
-
-        for c in tv["columns"]:
-            tv.heading(c, command=lambda c=c: sort(c, False))
+        ui.zebra(tv)
 
     def _hint_if_empty(self, tv, text):
-        if not tv.get_children():
-            vals = [""] * len(tv["columns"])
-            vals[0] = text
-            tv.insert("", "end", values=vals, tags=("hint",))
+        ui.hint_if_empty(tv, text)
 
-    def _tree(self, parent, spec, height=8, stretch=None):
-        """Treeview + auto-hiding styled scrollbar. spec: (name,width,anchor)."""
-        wrap = tk.Frame(parent, bg=DUSK)
-        cols = [n for n, _w, _a in spec]
-        tv = ttk.Treeview(wrap, columns=cols, show="headings",
-                          style="KV.Treeview", height=height,
-                          selectmode="browse")
-        for name, wdt, anc in spec:
-            tv.heading(name, text=name.upper())
-            tv.column(name, width=wdt, anchor=anc, stretch=(name == stretch))
-        sb = ttk.Scrollbar(wrap, orient="vertical", command=tv.yview,
-                           style="KV.Vertical.TScrollbar")
-        sb.pack(side="right", fill="y")
-        tv.pack(side="left", fill="both", expand=True)
+    def _tree(self, parent, spec, height=8, stretch=None, bg=None):
+        return ui.tree(parent, spec, height=height, stretch=stretch,
+                       bg=bg or DUSK)
 
-        def set_sb(lo, hi):
-            sb.set(lo, hi)
-            try:
-                if float(lo) <= 0.0 and float(hi) >= 1.0:
-                    sb.pack_forget()
-                elif not sb.winfo_ismapped():
-                    sb.pack(side="right", fill="y", before=tv)
-            except Exception:
-                pass
-
-        tv.configure(yscrollcommand=set_sb)
-        tv.tag_configure("pos", foreground=GREEN)
-        tv.tag_configure("neg", foreground=RED)
-        tv.tag_configure("dim", foreground=FAINT)
-        tv.tag_configure("mine", foreground=RUFOUS_HI)
-        self._style_table(tv)
-        return wrap, tv
 
     # ----------------------------------------------------------------- menu
     def _build_menu(self):
@@ -921,6 +722,16 @@ class App(tk.Tk):
                            command=self._save_announcements_pref)
         sm.add_command(label="Forget dismissed announcements",
                        command=self._reset_announcements)
+        sm.add_separator()
+        # Turning update checks off was a one-way door: the toast that
+        # confirmed it said "Settings turns them back on", and Settings
+        # had no such item. It does now.
+        self.updates_on = tk.BooleanVar(
+            value=bool(self.settings.get("check_updates", True)))
+        sm.add_checkbutton(label="Check for new versions",
+                           variable=self.updates_on,
+                           onvalue=True, offvalue=False,
+                           command=self._toggle_update_checks)
         bar.add_cascade(label="Settings", menu=sm)
         hm = tk.Menu(bar, tearoff=0, **mk)
         hm.add_command(label="About Kestrel Miner", command=self._about)
@@ -945,7 +756,8 @@ class App(tk.Tk):
     def _shortcuts(self):
         self._say(
             "Keyboard shortcuts",
-            "Ctrl+1…4   switch view (Mine / Explorer / Network / Activity)\n"
+            "Ctrl+1…5   switch view "
+            "(Mine / Wallet / Explorer / Network / Activity)\n"
             "Ctrl+M      start / stop mining\n"
             "F5             refresh everything now\n"
             "Ctrl+A        select all in any text box\n"
@@ -970,15 +782,15 @@ class App(tk.Tk):
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
 
-        rail = tk.Frame(body, bg=RAIL, width=182)
+        rail = tk.Frame(body, bg=RAIL, width=212)
         rail.grid(row=0, column=0, sticky="nsw")
         rail.pack_propagate(False)
+        tk.Frame(body, bg=LINE_SOFT, width=1).grid(row=0, column=0,
+                                                   sticky="nse")
         brand = tk.Frame(rail, bg=RAIL)
-        brand.pack(fill="x", padx=18, pady=(18, 22))
-        tk.Label(brand, text="▲ kestrel", bg=RAIL, fg=BUFF,
-                 font=BRAND).pack(anchor="w")
-        tk.Label(brand, text="MINER", bg=RAIL, fg=RUFOUS_HI,
-                 font=TINY_B).pack(anchor="w")
+        brand.pack(fill="x", padx=ui.PAD_L, pady=(ui.PAD_L, ui.PAD_XL - 4))
+        ui.brand(brand, "kestrel", sub="miner", bg=RAIL, size=32
+                 ).pack(anchor="w")
 
         self._navbtn = {}
         for name in self.VIEWS:
@@ -987,35 +799,40 @@ class App(tk.Tk):
             ind = tk.Frame(rowf, bg=RAIL, width=3)
             ind.pack(side="left", fill="y")
             b = tk.Button(rowf, anchor="w", relief="flat",
-                          text=f"  {self.ICONS.get(name, '')}  {name}",
+                          text=f"   {self.ICONS.get(name, '')}   {name}",
                           bd=0, bg=RAIL, fg=MUTED, activebackground=DUSK2,
-                          activeforeground=BUFF, font=SANS_B, padx=14, pady=10,
-                          cursor="hand2",
+                          activeforeground=BUFF, font=SANS_B,
+                          padx=12, pady=11, cursor="hand2",
+                          highlightthickness=0,
                           command=lambda n=name: self.show_view(n))
             b.pack(side="left", fill="x", expand=True)
 
             def hov(_e, nm=name, on=True):
                 bb, _i, _r = self._navbtn[nm]
                 if nm != getattr(self, "_active_view", None):
-                    bb.configure(bg="#1A2130" if on else RAIL)
+                    bb.configure(bg=ui.mix(RAIL, BUFF, 0.06) if on else RAIL)
             b.bind("<Enter>", lambda e, nm=name: hov(e, nm, True))
             b.bind("<Leave>", lambda e, nm=name: hov(e, nm, False))
             self._navbtn[name] = (b, ind, rowf)
 
         foot = tk.Frame(rail, bg=RAIL)
-        foot.pack(side="bottom", fill="x", padx=18, pady=16)
+        foot.pack(side="bottom", fill="x", padx=ui.PAD_L, pady=ui.PAD_M + 2)
         self.net_pill = tk.StringVar(value="starting node…")
-        row = tk.Frame(foot, bg=RAIL); row.pack(anchor="w")
-        self.dot_l = tk.Label(row, text="●", bg=RAIL, fg=FAINT,
-                              font=SANS)
-        self.dot_l.pack(side="left")
+        row = tk.Frame(foot, bg=RAIL); row.pack(anchor="w", fill="x")
+        self.dot_l = tk.Label(row, text="●", bg=RAIL, fg=FAINT, font=SANS_9)
+        self.dot_l.pack(side="left", anchor="n")
         tk.Label(row, textvariable=self.net_pill, bg=RAIL, fg=MUTED,
-                 font=SANS_9).pack(side="left", padx=(5, 0))
+                 font=SANS_9, anchor="w", justify="left", wraplength=150
+                 ).pack(side="left", padx=(5, 0))
         self.mine_pill = tk.StringVar(value="")
         tk.Label(foot, textvariable=self.mine_pill, bg=RAIL, fg=RUFOUS_HI,
-                 font=TINY).pack(anchor="w", pady=(3, 0))
-        tk.Label(foot, text=f"v{KVER} · MIT", bg=RAIL, fg=FAINT,
-                 font=MONO_8).pack(anchor="w", pady=(4, 0))
+                 font=TINY, anchor="w", wraplength=168
+                 ).pack(fill="x", pady=(4, 0))
+        tk.Frame(foot, bg=LINE_SOFT, height=1).pack(fill="x",
+                                                    pady=(ui.PAD_M, ui.PAD_S))
+        tk.Label(foot, text=f"v{KVER} · MIT", bg=RAIL,
+                 fg=ui.mix(RAIL, BUFF, 0.22), font=MONO_8,
+                 anchor="w").pack(fill="x")
 
         content = tk.Frame(body, bg=DUSK)
         content.grid(row=0, column=1, sticky="nsew")
@@ -1031,20 +848,24 @@ class App(tk.Tk):
             builder(f)
             self._views[name] = f
 
-        # A quiet strip that only ever appears if a newer version exists.
-        self.update_bar = tk.Frame(self, bg=DUSK3)
+        # Messages belong over the page, not over the status bar and the
+        # update strip below it — a card sitting on those swallows the
+        # clicks meant for their buttons.
+        self.toasts.in_area(content)
+
+        # A strip that only ever appears if a newer version exists.
+        self.update_bar, ub = ui.spined_card(self, "accent", pad=ui.PAD_S)
         self.update_msg = tk.StringVar(value="")
-        tk.Label(self.update_bar, textvariable=self.update_msg, bg=DUSK3,
-                 fg=BUFF, font=SANS_9, anchor="w", padx=14,
-                 pady=6).pack(side="left", fill="x", expand=True)
-        self._btn(self.update_bar, "Get it", self._open_releases,
-                  primary=True, tip="Open the downloads page"
-                  ).pack(side="right", padx=(0, 8), pady=4)
-        self._btn(self.update_bar, "Later",
-                  lambda: self.update_bar.pack_forget(),
-                  tip="Hide this until next launch"
-                  ).pack(side="right", padx=(0, 6), pady=4)
-        # deliberately not packed — shown only by _offer_update
+        tk.Label(ub, textvariable=self.update_msg, bg=DUSK, fg=BUFF,
+                 font=SANS_9, anchor="w", justify="left"
+                 ).pack(side="left", fill="x", expand=True)
+        ui.button(ub, "See what changed", lambda: self._update_dialog(
+            self._update_rel) if self._update_rel else None,
+            kind="primary").pack(side="right", padx=(ui.PAD_S, 0))
+        ui.button(ub, "Later", lambda: self.update_bar.pack_forget(),
+                  bg_of=DUSK, tip="Hide this until next launch"
+                  ).pack(side="right")
+        # deliberately not packed — shown only when there is something
 
         # Announcements from the project. This sits directly under the
         # title bar rather than at the foot of the window: the bottom edge
@@ -1096,21 +917,173 @@ class App(tk.Tk):
                  font=SANS_9, anchor="w", padx=14,
                  pady=5).pack(side="left", fill="x", expand=True)
         self.show_view("Mine")
-        updates.check(self._offer_update)
+        self._check_updates()
         self._check_announcements()
 
+    # --------------------------------------------------------------- updates
+    #
+    # Ask, then do it. The check is quiet and in the background; if
+    # something newer exists the app says what changed and waits. Nothing
+    # is downloaded before the person says yes, the download is checked
+    # against the checksum published with the release, and the wallet
+    # file, settings and ledger are never touched.
+
     def _open_releases(self):
-        import webbrowser
         webbrowser.open(updates.RELEASES_PAGE)
 
-    def _offer_update(self, latest, url):
-        """Called from the update check — only when one really exists."""
-        def show():
-            self.update_msg.set(
-                f"Kestrel {latest} is available — you're on {KVER}. "
-                f"Updating keeps you in step with the network.")
+    def _check_updates(self, *, manual=False):
+        if not manual and not self.settings.get("check_updates", True):
+            return
+        updates.cleanup(_HERE)
+        if manual:
+            self.toast("Checking for a newer version…")
+
+        def run():
+            rel = updates.fetch_latest()
+            if rel and updates.is_newer(rel["version"]):
+                self.q.put(("update", rel, manual))
+            elif manual:
+                self.q.put(("toast", f"You're on the newest version "
+                                     f"({KVER}).", "good"))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_update_available(self, rel, manual=False):
+        self._update_rel = rel
+        self.update_msg.set(
+            f"Kestrel {rel['version']} is available — you're on {KVER}. "
+            f"Updating keeps you in step with the network.")
+        if not self.update_bar.winfo_ismapped():
             self.update_bar.pack(fill="x", side="bottom")
-        self.after(0, show)
+        if manual or self.settings.get("update_prompted") != rel["version"]:
+            self.settings["update_prompted"] = rel["version"]
+            save_settings(self.settings)
+            self._update_dialog(rel)
+
+    def _update_dialog(self, rel):
+        can, why = updates.can_install(_HERE)
+        mining = self.mining.is_set()
+        top = self._dialog(f"Kestrel {rel['version']} is available")
+        tk.Frame(top, bg=RUFOUS, height=3).pack(fill="x")
+        body = tk.Frame(top, bg=DUSK2, padx=24, pady=20)
+        body.pack(fill="both", expand=True)
+        tk.Label(body, text=f"Kestrel {rel['version']} is available",
+                 bg=DUSK2, fg=BUFF, font=H2, anchor="w").pack(fill="x")
+        tk.Label(body, text=f"You have {KVER}.", bg=DUSK2, fg=FAINT,
+                 font=SANS_9, anchor="w").pack(fill="x", pady=(2, 0))
+
+        bullets = updates.summarize(rel.get("notes", ""))
+        if bullets:
+            box = tk.Frame(body, bg=SPOT)
+            box.pack(fill="x", pady=(14, 0))
+            for i, line in enumerate(bullets):
+                tk.Label(box, text="•  " + line, bg=SPOT, fg=MUTED,
+                         font=SANS_9, anchor="w", justify="left",
+                         wraplength=430).pack(fill="x", padx=14,
+                                              pady=(7 if not i else 1, 0))
+            tk.Frame(box, bg=SPOT, height=8).pack(fill="x")
+
+        note = ("Mining stops while the update installs, and starts again "
+                "with the app." if mining else
+                "Your wallet file, settings and ledger are left exactly as "
+                "they are. The previous version is kept until the new one "
+                "starts.")
+        tk.Label(body, text=note if can else why, bg=DUSK2,
+                 fg=MUTED if can else AMBER, font=SANS_9, anchor="w",
+                 justify="left", wraplength=450).pack(fill="x", pady=(14, 0))
+
+        self._up_status = tk.StringVar(value="")
+        st = tk.Label(body, textvariable=self._up_status, bg=DUSK2, fg=SLATE,
+                      font=SANS_9, anchor="w")
+        self._up_meter = ui.Meter(body, bg=DUSK2)
+        row = tk.Frame(body, bg=DUSK2); row.pack(fill="x", pady=(20, 0))
+        cancel = threading.Event()
+
+        def close():
+            cancel.set(); top.destroy()
+
+        def never():
+            self.settings["check_updates"] = False
+            save_settings(self.settings)
+            # keep the menu tick in step with the choice made here
+            try:
+                self.updates_on.set(False)
+            except Exception:
+                pass
+            self.toast("Update checks turned off — Settings ▸ Check for "
+                       "new versions turns them back on.")
+            close()
+
+        def work():
+            try:
+                updates.install(
+                    rel, "kestrel-miner", _HERE, os.path.abspath(__file__),
+                    on_step=lambda m: self.q.put(("upstep", m)),
+                    on_progress=lambda g, t: self.q.put(("upprog", g, t)),
+                    cancel=cancel)
+                self.q.put(("upok",))
+            except Exception as e:
+                self.q.put(("upfail", str(e)))
+
+        def go():
+            go_btn.configure(state="disabled", text="Updating…")
+            later_btn.configure(state="disabled")
+            if self.mining.is_set():
+                self.stop_mining()
+            st.pack(fill="x", pady=(14, 6), before=row)
+            self._up_meter.pack(fill="x", before=row)
+            self._up_meter.start()
+            threading.Thread(target=work, daemon=True).start()
+
+        go_btn = ui.button(row, "Update and restart", go, kind="primary")
+        if can:
+            go_btn.pack(side="left")
+        later_btn = ui.button(row, "Not now", close, bg_of=DUSK2)
+        later_btn.pack(side="left", padx=(ui.PAD_S, 0))
+        self._linkbtn(row, "Downloads page", self._open_releases,
+                      bg=DUSK2).pack(side="left", padx=(ui.PAD_S, 0))
+        self._linkbtn(row, "Never check", never, bg=DUSK2).pack(side="right")
+        top.protocol("WM_DELETE_WINDOW", close)
+        top.bind("<Escape>", lambda _e: close())
+        self._present_dialog(top, modal=False)
+        self._up_dialog = top
+
+    def _update_step(self, msg):
+        if hasattr(self, "_up_status"):
+            self._up_status.set(msg)
+
+    def _update_progress(self, got, total):
+        if not hasattr(self, "_up_meter"):
+            return
+        if total:
+            self._up_meter.set(got / total)
+            self._update_step(f"Downloading… {got / 1e6:.1f} of "
+                              f"{total / 1e6:.1f} MB")
+        else:
+            self._update_step(f"Downloading… {got / 1e6:.1f} MB")
+
+    def _update_done(self):
+        self._update_step("Restarting Kestrel…")
+        self.toast("Update installed — Kestrel is restarting.", "good")
+        self.after(900, self._quit)
+
+    def _update_failed(self, why):
+        if hasattr(self, "_up_meter"):
+            self._up_meter.stop()
+        try:
+            self._up_dialog.destroy()
+        except Exception:
+            pass
+        self._error("Update failed",
+                    f"{why}\n\nNothing was changed — you are still running "
+                    f"{KVER}. You can download the new version yourself "
+                    f"from the releases page.")
+
+    def _toggle_update_checks(self):
+        on = bool(self.updates_on.get())
+        self.settings["check_updates"] = on
+        save_settings(self.settings)
+        if on:
+            self._check_updates(manual=True)
 
     # ------------------------------------------------------ announcements
 
@@ -1138,9 +1111,18 @@ class App(tk.Tk):
         if not self.settings.get("announcements", True):
             return
         seen = self.settings.get("announcements_seen", [])
-        announcements.check(self._on_announcements, seen)
-        self._note_job = self.after(ANNOUNCE_EVERY_MS,
-                                    self._check_announcements)
+        # Re-arm FIRST. Booking the next check only after a successful
+        # fetch meant anything that threw in between — a thread that
+        # wouldn't start, a Tcl hiccup — ended announcements for the rest
+        # of the session, silently. This is the one repeating job in the
+        # app that predates the resilient loops in ui.py.
+        try:
+            self._note_job = self.after(ANNOUNCE_EVERY_MS,
+                                        self._check_announcements)
+        except Exception:
+            self._note_job = None
+        self.safe(announcements.check, self._on_announcements, seen,
+                  where="announcements")
 
     def _on_announcements(self, items):
         """Called from a background thread, only when something is new."""
@@ -1265,6 +1247,9 @@ class App(tk.Tk):
             self._refresh_peers()
         elif name == "Explorer":
             self._paint_blocks()
+        elif name == "Mine" and getattr(self, "_spark_owed", False):
+            self._spark_owed = False        # resized while it was hidden
+            self.safe(self._draw_spark, where="spark redraw")
         for nm, (b, ind, rowf) in self._navbtn.items():
             on = (nm == name)
             b.configure(bg=DUSK2 if on else RAIL, fg=BUFF if on else MUTED)
@@ -1302,6 +1287,26 @@ class App(tk.Tk):
     def toast(self, text, kind="info"):
         self.toasts.show(text, kind)
 
+    def on_internal_error(self, where, exc):
+        """Say something went wrong, once, without a wall of Python.
+
+        Silent failure is what made the last round of bugs so hard to
+        pin down: the app looked fine and simply stopped finding things
+        out. One quiet line is enough to tell someone their log is worth
+        a look, and Resilient only calls this the first time each
+        distinct failure happens, so it can never become a drumbeat.
+        """
+        if getattr(self, "_telling", False):
+            return          # the failure was in here: don't chase our tail
+        self._telling = True
+        try:
+            self.toast("Something went wrong inside the app — it kept "
+                       "going. Details are in kestrel-log.txt.", "warn")
+        except Exception:
+            pass
+        finally:
+            self._telling = False
+
     # ----------------------------------------------------------------- mine
     def _view_mine(self, f):
         p = self._page(f, "Mine", "Rewards are paid straight to your address")
@@ -1337,62 +1342,79 @@ class App(tk.Tk):
                                   font=TINY, anchor="w")
         self.addr_hint.pack(fill="x", pady=(3, 10))
 
-        mid = tk.Frame(p, bg=DUSK); mid.pack(fill="x")
-        left = tk.Frame(mid, bg=DUSK); left.pack(side="left", anchor="n")
+        # The control panel: the button people came for on the left,
+        # the speed they came to watch on the right, in one card so the
+        # two read as a single instrument rather than scattered controls.
+        panel, mid = ui.card(p, bg=DUSK2)
+        panel.pack(fill="x")
+        mid.columnconfigure(0, weight=0, minsize=330)
+        mid.columnconfigure(1, weight=1)
+
+        left = tk.Frame(mid, bg=DUSK2)
+        left.grid(row=0, column=0, sticky="nw", padx=(0, ui.PAD_XL))
         self.mine_btn = tk.Button(left, text="▶  Start mining",
-                                  command=self.toggle, bg=RUFOUS, fg=DUSK,
+                                  command=self.toggle, bg=RUFOUS, fg=INK,
                                   activebackground=RUFOUS_HI,
-                                  activeforeground=DUSK, relief="flat",
-                                  font=BIGBTN, padx=24,
-                                  pady=12, cursor="hand2", bd=0)
-        self.mine_btn.pack(anchor="w")
+                                  activeforeground=INK, relief="flat",
+                                  font=BIGBTN, padx=26, pady=13,
+                                  cursor="hand2", bd=0, highlightthickness=0)
+        self.mine_btn.pack(anchor="w", fill="x")
         Tooltip(self.mine_btn, "Ctrl+M works too")
 
-        trow = tk.Frame(left, bg=DUSK); trow.pack(anchor="w", pady=(12, 0))
-        tk.Label(trow, text="CPU threads", bg=DUSK, fg=MUTED,
-                 font=SANS_9).pack(side="left")
+        trow = tk.Frame(left, bg=DUSK2); trow.pack(anchor="w",
+                                                   pady=(ui.PAD_M, 0))
+        tk.Label(trow, text="CPU THREADS", bg=DUSK2, fg=FAINT,
+                 font=MICRO_B).pack(side="left")
         cores = os.cpu_count() or 2
         self.threads_var = tk.IntVar(
             value=int(self.settings.get("threads", default_threads())))
         sp = tk.Spinbox(trow, from_=1, to=cores, width=4,
                         textvariable=self.threads_var, bg=SPOT, fg=BUFF,
-                        insertbackground=BUFF, relief="flat", font=MONO,
+                        insertbackground=RUFOUS_HI, relief="flat", font=MONO,
                         buttonbackground=DUSK3, highlightthickness=1,
-                        highlightbackground=DUSK3)
-        sp.pack(side="left", padx=(8, 6))
+                        highlightbackground=LINE, bd=0)
+        sp.pack(side="left", padx=(ui.PAD_S, 6))
         Tooltip(sp, "More threads = more hashes per second.\n"
                     "Leave one core free so the computer stays smooth.")
-        tk.Label(trow, text=f"of {cores} cores", bg=DUSK, fg=FAINT,
+        tk.Label(trow, text=f"of {cores} cores", bg=DUSK2, fg=FAINT,
                  font=TINY).pack(side="left")
 
         self.autostart_var = tk.BooleanVar(
             value=bool(self.settings.get("autostart")))
         cb = tk.Checkbutton(left, text="Start mining when the app opens",
-                            variable=self.autostart_var, bg=DUSK, fg=MUTED,
-                            activebackground=DUSK, activeforeground=BUFF,
+                            variable=self.autostart_var, bg=DUSK2, fg=MUTED,
+                            activebackground=DUSK2, activeforeground=BUFF,
                             selectcolor=SPOT, font=SANS_9, bd=0,
                             highlightthickness=0, cursor="hand2",
                             command=self._save_autostart)
-        cb.pack(anchor="w", pady=(8, 0))
+        cb.pack(anchor="w", pady=(ui.PAD_M, 0))
 
         self.found_var = tk.StringVar(
             value="No blocks yet this session — press Start")
-        tk.Label(left, textvariable=self.found_var, bg=DUSK, fg=MUTED,
-                 font=SANS, wraplength=340, justify="left"
-                 ).pack(anchor="w", pady=(10, 0))
+        tk.Label(left, textvariable=self.found_var, bg=DUSK2, fg=MUTED,
+                 font=SANS_9, wraplength=310, justify="left", anchor="w"
+                 ).pack(fill="x", pady=(ui.PAD_M, 0))
 
-        right = tk.Frame(mid, bg=DUSK); right.pack(side="right", anchor="n")
+        right = tk.Frame(mid, bg=DUSK2)
+        right.grid(row=0, column=1, sticky="nsew")
+        rhead = tk.Frame(right, bg=DUSK2); rhead.pack(fill="x")
+        tk.Label(rhead, text="MINING SPEED", bg=DUSK2, fg=FAINT,
+                 font=MICRO_B).pack(side="left", pady=(4, 0))
         self.rate_var = tk.StringVar(value="0 H/s")
-        tk.Label(right, textvariable=self.rate_var, bg=DUSK, fg=SLATE,
-                 font=MONO_20B).pack(anchor="e")
-        tk.Label(right, text="mining speed", bg=DUSK, fg=FAINT,
-                 font=TINY).pack(anchor="e")
-        self.spark = tk.Canvas(right, width=320, height=64, bg=SPOT,
-                               highlightthickness=1, highlightbackground=DUSK3)
-        self.spark.pack(anchor="e", pady=(8, 0))
+        tk.Label(rhead, textvariable=self.rate_var, bg=DUSK2, fg=BUFF,
+                 font=MONO_15B).pack(side="right")
+        self.spark = tk.Canvas(right, height=88, bg=SPOT,
+                               highlightthickness=1, highlightbackground=LINE,
+                               bd=0)
+        self.spark.pack(fill="both", expand=True, pady=(6, 0))
+        self.spark.bind("<Configure>", self._spark_resized)
+        self._spark_size = (0, 0)
+        self._spark_job = None
+        self._spark_last = 0.0
+        self._spark_owed = False
         self.eta_var = tk.StringVar(value="")
-        tk.Label(right, textvariable=self.eta_var, bg=DUSK, fg=FAINT,
-                 font=TINY).pack(anchor="e", pady=(4, 0))
+        tk.Label(right, textvariable=self.eta_var, bg=DUSK2, fg=FAINT,
+                 font=TINY, anchor="w").pack(fill="x", pady=(6, 0))
         self.sess_var = tk.StringVar(value="")
         tk.Label(right, textvariable=self.sess_var, bg=DUSK, fg=FAINT,
                  font=TINY).pack(anchor="e")
@@ -1518,6 +1540,15 @@ class App(tk.Tk):
         t = self.ex_out
         t.configure(state="normal")
         t.delete("1.0", "end")
+        # Deleting text drops a tag's RANGES but keeps the tag itself, its
+        # configuration and its bindings — forever. Every search used to
+        # leave its link tags behind, so a few hundred searches meant
+        # thousands of dead tags and their closures still attached to this
+        # one widget, and Tk does per-tag work on every insert.
+        for old in t.tag_names():
+            if old.startswith("lk"):
+                t.tag_delete(old)
+        self._ex_links = 0
         for text, tag, link in lines:
             if link is not None:
                 self._ex_links += 1
@@ -2130,7 +2161,7 @@ class App(tk.Tk):
                              relief="flat", wrap="word", state="disabled",
                              padx=8, pady=6)
         sb = ttk.Scrollbar(lf, orient="vertical", command=self.log_t.yview,
-                           style="KV.Vertical.TScrollbar")
+                           style="K.Vertical.TScrollbar")
         sb.pack(side="right", fill="y")
         self.log_t.configure(yscrollcommand=sb.set)
         self.log_t.pack(fill="both", expand=True)
@@ -2195,76 +2226,84 @@ class App(tk.Tk):
         self.q.put(("log", msg, tag, None))
         self.q.put(("stats",))
 
-    def _drain_queue(self):
-        try:
-            while True:
-                kind, *rest = self.q.get_nowait()
-                if kind == "log":
-                    msg, tag, cat = rest
-                    self._append_log(time.strftime("%H:%M:%S"), msg, tag,
-                                     cat or self._cat_of(msg, tag))
-                elif kind == "rate":
-                    self._on_rate(rest[0])
-                elif kind == "found":
-                    n, feathers = rest
-                    s = "" if n == 1 else "s"
-                    self.found_var.set(
-                        f"You have mined {n} block{s} this session — "
-                        f"{format_ksl(feathers)} earned")
-                    self.chip_sess.set(format_ksl(feathers))
-                    self.chip_found.set(f"{n:,}")
-                elif kind == "foundrow":
-                    height, nonce, reward = rest
-                    for iid in self.found_tv.get_children():
-                        if "hint" in self.found_tv.item(iid, "tags"):
-                            self.found_tv.delete(iid)
-                    self.found_tv.insert(
-                        "", 0, tags=("pos",),
-                        values=(time.strftime("%H:%M:%S"), f"{height:,}",
-                                f"{nonce:,}", "+" + format_ksl(reward)))
-                    self._zebra(self.found_tv)
-                    self.toast(f"★ Block {height:,} mined — "
-                               f"+{format_ksl(reward)} to your address",
-                               "good")
-                elif kind == "lifetime":
-                    reward = rest[0]
-                    self.settings["lifetime_feathers"] = \
-                        int(self.settings.get("lifetime_feathers", 0)) + reward
-                    self.settings["lifetime_blocks"] = \
-                        int(self.settings.get("lifetime_blocks", 0)) + 1
-                    save_settings(self.settings)
-                    self._paint_lifetime()
-                elif kind == "wsent":
-                    self.w_send_btn.configure(state="normal")
-                    self._w_say(f"✓ Sent {rest[0]} — the next block "
-                                f"confirms it, about 2 minutes.", GREEN)
-                    self.toast(f"✓ Sent {rest[0]}.", "good")
-                    self.w_to.delete(0, "end"); self.w_amt.delete(0, "end")
-                    self._refresh_wallet()
-                elif kind == "wfail":
-                    self.w_send_btn.configure(state="normal")
-                    self._w_say(f"Could not send: {rest[0]}", RED)
-                    self.toast("Could not send — see the Wallet tab.", "bad")
-                elif kind == "repaired":
-                    ok, msg = rest
-                    self.toast(msg, "good" if ok else "info")
-                    self.log(msg, "good" if ok else None)
-                    self._tick_now()
-                elif kind == "status":
-                    self.status_var.set(rest[0])
-                elif kind == "toast":
-                    self.toast(*rest)
-                elif kind == "connfail":
-                    title, msg = rest
-                    self.toast("Couldn't connect — see the details.", "bad")
-                    self._warn(title, msg)
-                elif kind == "fixdone":
-                    self._finish_fix(rest[0])
-                elif kind == "stats":
-                    self._refresh_stats()
-        except queue.Empty:
-            pass
-        self.after(150, self._drain_queue)
+    def _handle(self, kind, rest):
+        """One message from a worker thread. Failures here are
+        reported and skipped — they can no longer take the loop
+        down with them."""
+        if kind == "log":
+            msg, tag, cat = rest
+            self._append_log(time.strftime("%H:%M:%S"), msg, tag,
+                             cat or self._cat_of(msg, tag))
+        elif kind == "rate":
+            self._on_rate(rest[0])
+        elif kind == "found":
+            n, feathers = rest
+            s = "" if n == 1 else "s"
+            self.found_var.set(
+                f"You have mined {n} block{s} this session — "
+                f"{format_ksl(feathers)} earned")
+            self.chip_sess.set(format_ksl(feathers))
+            self.chip_found.set(f"{n:,}")
+        elif kind == "foundrow":
+            height, nonce, reward = rest
+            for iid in self.found_tv.get_children():
+                if "hint" in self.found_tv.item(iid, "tags"):
+                    self.found_tv.delete(iid)
+            self.found_tv.insert(
+                "", 0, tags=("pos",),
+                values=(time.strftime("%H:%M:%S"), f"{height:,}",
+                        f"{nonce:,}", "+" + format_ksl(reward)))
+            self._zebra(self.found_tv)
+            self.toast(f"★ Block {height:,} mined — "
+                       f"+{format_ksl(reward)} to your address",
+                       "good")
+        elif kind == "lifetime":
+            reward = rest[0]
+            self.settings["lifetime_feathers"] = \
+                int(self.settings.get("lifetime_feathers", 0)) + reward
+            self.settings["lifetime_blocks"] = \
+                int(self.settings.get("lifetime_blocks", 0)) + 1
+            save_settings(self.settings)
+            self._paint_lifetime()
+        elif kind == "wsent":
+            self.w_send_btn.configure(state="normal")
+            self._w_say(f"✓ Sent {rest[0]} — the next block "
+                        f"confirms it, about 2 minutes.", GREEN)
+            self.toast(f"✓ Sent {rest[0]}.", "good")
+            self.w_to.delete(0, "end"); self.w_amt.delete(0, "end")
+            self._refresh_wallet()
+        elif kind == "wfail":
+            self.w_send_btn.configure(state="normal")
+            self._w_say(f"Could not send: {rest[0]}", RED)
+            self.toast("Could not send — see the Wallet tab.", "bad")
+        elif kind == "repaired":
+            ok, msg = rest
+            self.toast(msg, "good" if ok else "info")
+            self.log(msg, "good" if ok else None)
+            self._tick_now()
+        elif kind == "status":
+            self.status_var.set(rest[0])
+        elif kind == "toast":
+            self.toast(*rest)
+        elif kind == "connfail":
+            title, msg = rest
+            self.toast("Couldn't connect — see the details.", "bad")
+            self._warn(title, msg)
+        elif kind == "fixdone":
+            self._finish_fix(rest[0])
+        elif kind == "stats":
+            self._refresh_stats()
+        elif kind == "update":
+            self._on_update_available(*rest)
+        elif kind == "upstep":
+            self._update_step(*rest)
+        elif kind == "upprog":
+            self._update_progress(*rest)
+        elif kind == "upok":
+            self._update_done()
+        elif kind == "upfail":
+            self._update_failed(*rest)
+
 
     def _on_rate(self, r):
         now = time.time()
@@ -2293,25 +2332,78 @@ class App(tk.Tk):
         else:
             self.mine_pill.set("")
 
+    def _start_loops(self):
+        """Every repeating job, on a loop that cannot die."""
+        self.drain(self.q, self._handle, ms=120, where="miner queue")
+        self.every(3000, self._tick, where="miner tick")
+
     def _tick(self):
         if self.state() == "iconic":        # minimized: poll lazily, cheaply
             self._refresh_stats()
-            self.after(8000, self._tick)
-            return
+            return 8000
         self._refresh_stats()
         view = getattr(self, "_active_view", None)
         if view == "Network":               # repaint a table only while shown
             self._refresh_peers()
         elif view == "Explorer":
             self._paint_blocks()
-        self.after(3000, self._tick)
+        return 3000
+
+    SPARK_SETTLE = 60          # ms of quiet before the chart is redrawn
+
+    def _spark_resized(self, e):
+        """Redraw once the drag settles rather than on every pixel."""
+        if (e.width, e.height) == self._spark_size:
+            return
+        self._spark_size = (e.width, e.height)
+        self._spark_last = time.time()
+        if self._spark_job is not None:
+            return                  # already waiting; _spark_settled re-checks
+        try:
+            self._spark_job = self.after(self.SPARK_SETTLE, self._spark_settled)
+        except Exception:
+            self._spark_job = None
+
+    def _spark_settled(self):
+        """Only draw once the resizing has genuinely stopped.
+
+        Cancelling and rebooking a timer per event is not enough on its
+        own: Tk delivers Configure in bursts with idle gaps between them,
+        and every gap longer than the delay lets the timer through, so a
+        single drag still repainted the chart dozens of times. Checking
+        when the last event actually arrived does not care how they were
+        delivered.
+        """
+        self._spark_job = None
+        quiet = (time.time() - getattr(self, "_spark_last", 0)) * 1000
+        if quiet < self.SPARK_SETTLE:
+            try:
+                self._spark_job = self.after(
+                    int(self.SPARK_SETTLE - quiet) + 5, self._spark_settled)
+                return
+            except Exception:
+                self._spark_job = None
+        self._draw_spark()
 
     def _draw_spark(self):
         c = self.spark
         if getattr(self, "_active_view", "Mine") != "Mine" or self.state() == "iconic":
-            return  # Mine view not on top (or minimized) — skip redraw, save CPU
+            # Not visible, so don't pay to draw it — but remember that we
+            # owe one. The canvas still receives <Configure> while another
+            # view is raised over it (they share the cell), and simply
+            # dropping those left the chart drawn for the OLD size with no
+            # further event coming to correct it: points bunched into a
+            # third of the panel until mining was restarted.
+            self._spark_owed = True
+            return
+        self._spark_owed = False
         c.delete("all")
-        w = int(c.cget("width")); h = int(c.cget("height"))
+        # the canvas fills its panel, so its real size is what winfo reports —
+        # cget("width") is only the size it asked for when it was created
+        w = c.winfo_width() or int(c.cget("width"))
+        h = c.winfo_height() or int(c.cget("height"))
+        if w < 20 or h < 20:
+            return                       # not laid out yet; Configure will call back
         if len(self.samples) < 2:
             c.create_text(w // 2, h // 2, fill=FAINT, font=MONO_8,
                           text="speed graph — warming up…")
@@ -2635,15 +2727,13 @@ class App(tk.Tk):
         r1 = tk.Frame(sc, bg=DUSK2); r1.pack(fill="x", pady=(8, 0))
         tk.Label(r1, text="To", bg=DUSK2, fg=MUTED, font=SANS_9,
                  width=7, anchor="w").pack(side="left")
-        self.w_to = tk.Entry(r1, bg=SPOT, fg=BUFF, insertbackground=BUFF,
-                             relief="flat", font=MONO_9)
+        self.w_to = self._entry(r1, f="mono_small")
         self.w_to.pack(side="left", fill="x", expand=True, ipady=6, ipadx=8)
 
         r2 = tk.Frame(sc, bg=DUSK2); r2.pack(fill="x", pady=(7, 0))
         tk.Label(r2, text="Amount", bg=DUSK2, fg=MUTED, font=SANS_9,
                  width=7, anchor="w").pack(side="left")
-        self.w_amt = tk.Entry(r2, bg=SPOT, fg=BUFF, insertbackground=BUFF,
-                              relief="flat", font=MONO_9, width=18)
+        self.w_amt = self._entry(r2, f="mono_small", width=18)
         self.w_amt.pack(side="left", ipady=6, ipadx=8)
         tk.Label(r2, text="KSL", bg=DUSK2, fg=FAINT,
                  font=SANS_9).pack(side="left", padx=(7, 0))
@@ -2654,8 +2744,7 @@ class App(tk.Tk):
         r3 = tk.Frame(sc, bg=DUSK2); r3.pack(fill="x", pady=(7, 0))
         tk.Label(r3, text="Fee", bg=DUSK2, fg=MUTED, font=SANS_9,
                  width=7, anchor="w").pack(side="left")
-        self.w_fee = tk.Entry(r3, bg=SPOT, fg=BUFF, insertbackground=BUFF,
-                              relief="flat", font=MONO_9, width=18)
+        self.w_fee = self._entry(r3, f="mono_small", width=18)
         self.w_fee.pack(side="left", ipady=6, ipadx=8)
         self.w_fee.insert(0, format_ksl(params.MIN_RELAY_FEE).split()[0])
         tk.Label(r3, text="KSL  ·  paid to whoever mines your transaction",
@@ -2802,6 +2891,23 @@ class App(tk.Tk):
             self.q.put(("wfail", str(e)))
 
     # --------------------------------------------------------------- stats
+    def _net_delta(self, tx, addr):
+        """What this transaction does to `addr`, on balance, in feathers.
+
+        Positive means money in, negative means money out. The node
+        already works this out for its /address endpoint — including
+        resolving each input back to the output it spends, which is the
+        part you cannot get from the transaction alone — so use that
+        rather than keeping a second, wronger copy here.
+        """
+        try:
+            self.node._reindex()
+            return self.node._deltas_of(tx).get(addr, 0)
+        except Exception:
+            # worst case, fall back to outputs only; better a row that
+            # reads high than no history at all
+            return sum(o.amount for o in tx.outputs if o.address == addr)
+
     def _refresh_wallet(self):
         """Balances, address and history for the Wallet tab."""
         if not hasattr(self, "w_addr_var"):
@@ -2825,9 +2931,14 @@ class App(tk.Tk):
             rows, mem_rows = [], []
             for b in reversed(self.chain.blocks[-400:]):
                 for tx in b.transactions:
-                    got = sum(o.amount for o in tx.outputs
-                              if o.address == addr)
-                    if not got:
+                    # What this payment did to THIS address, on balance.
+                    # Counting only the outputs made every payment you
+                    # SENT look like money arriving, because the change
+                    # comes back to you: send 10 of 25 and the tab
+                    # cheerfully reported "Received 14.99999 KSL" while
+                    # your balance had just gone down.
+                    delta = self._net_delta(tx, addr)
+                    if not delta:
                         continue
                     confs = height - b.height + 1
                     if tx.is_coinbase:
@@ -2835,37 +2946,66 @@ class App(tk.Tk):
                         status = ("spendable" if confs >= params.COINBASE_MATURITY
                                   else f"matures in "
                                        f"{params.COINBASE_MATURITY - confs} blocks")
-                    else:
+                    elif delta > 0:
                         kind = "Received"
+                        status = f"{confs} confirmation(s)"
+                    else:
+                        kind = "Sent"
                         status = f"{confs} confirmation(s)"
                     rows.append((time.strftime("%d %b, %H:%M",
                                                time.localtime(b.timestamp)),
                                  kind,
-                                 format_ksl(got), status))
+                                 format_ksl(abs(delta)), status))
                     if len(rows) >= 60:
                         break
                 if len(rows) >= 60:
                     break
-            for tx in self.chain.mempool.values():
-                got = sum(o.amount for o in tx.outputs if o.address == addr)
-                if got:
-                    mem_rows.append(("pending", "Incoming",
-                                     format_ksl(got), "waiting for a block"))
+            # In-flight payments, with how long they have been waiting.
+            # "waiting for a block" with no clock attached is what let a
+            # payment claim to be on its way indefinitely; the age says
+            # whether that is still a reasonable thing to believe.
+            now = time.time()
+            for txid, tx in self.chain.mempool.items():
+                delta = self._net_delta(tx, addr)
+                if not delta:
+                    continue
+                age = self.chain.mempool_age(txid, now=now)
+                seen = self.chain.mempool_seen.get(txid, now)
+                if age >= STUCK_AFTER:
+                    status, tag = f"stuck — waited {ui.fmt_age(age)}", "stuck"
+                elif age >= SLOW_AFTER:
+                    status, tag = f"slow — waiting {ui.fmt_age(age)}", "pend"
+                elif age < 30:
+                    status, tag = "waiting for a block", "pend"
+                else:
+                    status, tag = f"waiting {ui.fmt_age(age)}", "pend"
+                when = time.strftime("%d %b, %H:%M", time.localtime(seen))
+                mem_rows.append((tag, (when,
+                                       "Incoming" if delta > 0 else "Outgoing",
+                                       format_ksl(abs(delta)), status)))
         self.chip_w_spend.set(format_ksl(bal["spendable"]))
         self.chip_w_conf.set(format_ksl(bal["confirmed"]))
         self.chip_w_imm.set(format_ksl(bal["confirmed"] - bal["spendable"]))
         tv = self.w_tx
         tv.delete(*tv.get_children())
-        for r in mem_rows + rows:
-            tv.insert("", "end", values=r,
-                      tags=("dim",) if r[0] == "pending" else ())
+        for tag, r in mem_rows:
+            tv.insert("", "end", values=r, tags=(tag,))
+        for r in rows:
+            tv.insert("", "end", values=r)
+        ui.zebra(tv)
         self._hint_if_empty(tv, "Nothing yet — mine a block to get paid.")
 
     def _refresh_stats(self):
         try:
             self._refresh_wallet()
-        except Exception:
-            pass          # wallet tab is cosmetic; never break the miner
+            self._wallet_ok = time.time()
+        except Exception as e:
+            # Never let this take the miner down — but never hide it
+            # either. Swallowed silently, a wallet tab that fails on every
+            # single pass looks exactly like one that has nothing new to
+            # show, which is the worst way for a balance to be wrong.
+            self.report("wallet tab", e)
+            self._wallet_err = str(e)
         addr = self.addr_e.get().strip()
         with self.lock:
             h = self.chain.height
@@ -2919,7 +3059,8 @@ class App(tk.Tk):
 
         if self.node_serving:
             self.dot_l.configure(fg=GREEN if alive else SLATE)
-            self.net_pill.set(f"node on :{self.node.port} · {alive} peers")
+            self.net_pill.set(f"node :{self.node.port} · {alive} peer"
+                              f"{'s' if alive != 1 else ''}")
             self.net_big.set(f"Running on port {self.node.port}  ·  "
                              f"{alive} of {known} peer(s) online  ·  "
                              f"block {h:,}")

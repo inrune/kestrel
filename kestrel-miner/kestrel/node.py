@@ -59,11 +59,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import params
 from .block import Block
-from .blockchain import Blockchain, ValidationError
+from .blockchain import Blockchain, ValidationError, MEMPOOL_TTL
 from .transaction import Transaction, COINBASE_TXID
 from .wallet import format_ksl
 from .miner import assemble_candidate, find_pow
 from . import upnp
+from . import logfile
 from . import dashboard
 from .discovery import (LanDiscovery, load_seed_nodes, fetch_remote_seeds,
                         new_node_id, get_lan_ip, is_routable_url,
@@ -138,15 +139,20 @@ class Node:
             # advertise while reachable or still unknown; stop once we
             # KNOW inbound is blocked (a dead address helps no one)
             should_announce=lambda: self.reachable is not False)
-        # lazy indexes (rebuilt when the chain height changes)
+        # lazy indexes, extended block by block (see _reindex)
         self._index_at = -1
+        self._index_tip = None                    # tip the indexes describe
         self._tx_index: dict[str, tuple] = {}     # txid -> (height, tx)
         self._block_index: dict[str, int] = {}    # block_id -> height
+        self._addr_index: dict[str, list] = {}    # address -> [entries]
 
     # ------------------------------------------------------------------ log
 
     def _log(self, msg: str, level: str = "info"):
-        print(f"[node] {msg}")
+        # Goes to the log file always, and to the console only when the
+        # console is the point (the CLI). In a windowed app it used to
+        # print regardless, over whatever the person had in that terminal.
+        logfile.write(f"[node] {msg}", level=level)
         if self.on_log:
             try:
                 self.on_log(msg, level)
@@ -170,7 +176,7 @@ class Node:
         """Drop one known-dead, non-seed peer to make room for a fresh one.
         Dead addresses must never crowd live newcomers out of a full book."""
         worst, worst_fails = None, 0
-        for u in self.peers:
+        for u in list(self.peers):          # snapshot; see shareable_peers
             if u in self.seeds:
                 continue
             info = self.peer_info.get(u, {})
@@ -217,9 +223,15 @@ class Node:
         We hand out addresses the wider internet can actually connect to,
         preferring peers we've confirmed are alive. Our own public URL is
         included when known so newcomers can find us."""
-        routable = [u for u in self.peers if is_routable_url(u)]
-        alive = [u for u in routable
-                 if self.peer_info.get(u, {}).get("alive")]
+        # list(set) copies at C level with the GIL held, so it cannot
+        # observe a half-mutated set. A comprehension runs a Python-level
+        # predicate between steps, which lets another thread add or drop a
+        # peer mid-iteration and raises "set changed size during
+        # iteration" — in a loop that then dies for the rest of the run.
+        snapshot = list(self.peers)
+        info = dict(self.peer_info)
+        routable = [u for u in snapshot if is_routable_url(u)]
+        alive = [u for u in routable if info.get(u, {}).get("alive")]
         out = alive or routable
         mine = self.public_url()
         if mine and self.reachable and mine not in out:
@@ -250,8 +262,9 @@ class Node:
                 self._save_peers()
 
     def alive_peers(self) -> list[str]:
-        return [u for u in self.peers
-                if self.peer_info.get(u, {}).get("alive")]
+        info = dict(self.peer_info)           # snapshot; see shareable_peers
+        return [u for u in list(self.peers)
+                if info.get(u, {}).get("alive")]
 
     def _drop_self_peer(self, url: str):
         """A peer that turned out to be us, seen through another address."""
@@ -376,17 +389,26 @@ class Node:
 
     def _announce_loop(self):
         while not self._stop.is_set():
-            # live peers and seeds always; a handful of untried ones too —
-            # in parallel, so a pile of dead addresses can't stall the loop
-            targets = set(self.alive_peers()) | (self.seeds & self.peers)
-            untried = [u for u in self.peers
-                       if u not in targets and u not in self.peer_info]
-            targets |= set(untried[:8])
-            if targets:
-                with ThreadPoolExecutor(
-                        max_workers=min(SYNC_WORKERS, len(targets))) as ex:
-                    list(ex.map(self.announce_to, targets))
+            try:
+                self._announce_round()
+            except Exception as e:
+                logfile.exception("announce loop", e)
             self._stop.wait(ANNOUNCE_INTERVAL)
+
+    def _announce_round(self):
+        """Tell peers and seeds we are here. One pass."""
+        # live peers and seeds always; a handful of untried ones too —
+        # in parallel, so a pile of dead addresses can't stall the loop
+        known = list(self.peers)
+        info = dict(self.peer_info)
+        targets = set(self.alive_peers()) | (self.seeds & set(known))
+        untried = [u for u in known if u not in targets and u not in info]
+        targets |= set(untried[:8])
+        if not targets:
+            return
+        with ThreadPoolExecutor(
+                max_workers=min(SYNC_WORKERS, len(targets))) as ex:
+            list(ex.map(self.announce_to, targets))
 
     def _greet_and_sync(self, url: str):
         # runs in a background thread — must never raise (unreachable peers
@@ -446,7 +468,11 @@ class Node:
                         self._log(f"Adopted heavier chain from {peer} "
                                   f"(block {self.chain.height:,})", "good")
 
-        # mempool sync: pick up pending transactions we don't have
+        # Mempool sync: pick up pending transactions we don't have.
+        # add_transaction refuses anything this node recently gave up on, so
+        # a peer that still holds an expired payment can't hand it straight
+        # back and restart the clock. Without that, expiry cannot work at
+        # all on a network of more than one node.
         try:
             mp = self._http_json("GET", peer + "/mempool", timeout=10)
             with self.lock:
@@ -470,12 +496,19 @@ class Node:
         used to hold the whole loop hostage for its full timeout; now a
         dead peer costs nothing and a live one connects immediately."""
         peers = list(self.peers)
-        if not peers:
+        if not peers or self._stop.is_set():
             self._sync_attempts += 1
             return
-        with ThreadPoolExecutor(
-                max_workers=min(SYNC_WORKERS, len(peers))) as ex:
-            list(ex.map(self._sync_quiet, peers))
+        try:
+            with ThreadPoolExecutor(
+                    max_workers=min(SYNC_WORKERS, len(peers))) as ex:
+                list(ex.map(self._sync_quiet, peers))
+        except RuntimeError:
+            # The app is closing and Python is tearing the interpreter
+            # down underneath us; new threads can no longer be started.
+            # There is nothing left to sync to, so this is the end of the
+            # loop, not an error worth printing a traceback about.
+            return
         self._sync_attempts += 1
         if self.alive_peers():
             self.joined_network = True
@@ -573,6 +606,26 @@ class Node:
             self._last_remap = now
             threading.Thread(target=self._setup_reachability,
                              kwargs={"renew": True}, daemon=True).start()
+        # Re-examine pending transactions even when no block has arrived.
+        # add_block does this on every new tip, but a node that is offline,
+        # still syncing or simply on a quiet network gets no tips — and
+        # that is exactly when a payment sits there claiming to be on its
+        # way. The clock has to run regardless of the chain.
+        with self.lock:
+            changed = self.chain.revalidate_mempool()
+            for txid, why in changed:
+                if why != "confirmed":
+                    self._log(f"Pending transaction {txid[:12]}… dropped "
+                              f"({why})", "warn")
+            if changed:
+                # write it down, or a restart brings the expired payment
+                # back as pending for as long as it takes to notice again
+                try:
+                    self.chain._save_pool()
+                except OSError as e:
+                    logfile.write(f"could not write the mempool to disk "
+                                  f"({e})", level="warn")
+
         if self.alive_peers():
             if (self.reachable is None
                     or now - self._last_recheck > RECHECK_INTERVAL):
@@ -595,9 +648,23 @@ class Node:
                                  daemon=True).start()
 
     def _sync_loop(self):
+        """Peer sync and periodic self-healing, forever.
+
+        This one loop owns mempool expiry, reachability re-checks, router
+        lease renewal and seed refresh. It is started once and never
+        restarted, so an exception escaping here did not skip a round —
+        it ended all of that for the rest of the process, silently, while
+        the node carried on looking healthy. Nothing gets to do that.
+        """
         while not self._stop.is_set():
-            self.sync_once()
-            self._maintain()
+            try:
+                self.sync_once()
+            except Exception as e:
+                logfile.exception("sync loop", e)
+            try:
+                self._maintain()
+            except Exception as e:
+                logfile.exception("maintenance", e)
             self._stop.wait(SYNC_INTERVAL)
 
     def public_url(self):
@@ -711,16 +778,55 @@ class Node:
     # -------------------------------------------------------- chain indexing
 
     def _reindex(self):
-        """Rebuild txid / block-id lookups if the chain has moved."""
-        if self._index_at == self.chain.height and self._tx_index:
+        """Keep the txid / block-id / address lookups level with the chain.
+
+        This used to rebuild all three from genesis whenever the height
+        changed — once per block, over the whole chain, holding the node
+        lock. On a young chain nobody notices; by a few hundred thousand
+        blocks it is seconds of work every two minutes, and every wallet
+        asking for its balance waits behind it. The chain almost always
+        just grew by a block or two, so index only what is new and fall
+        back to a full rebuild when the tip does not line up (a reorg).
+        """
+        c = self.chain
+        if self._index_at == c.height and self._index_tip == c.tip.block_id \
+                and self._tx_index:
             return
-        tx_idx, blk_idx = {}, {}
-        for b in self.chain.blocks:
-            blk_idx[b.block_id] = b.height
+
+        start = 0
+        if (self._tx_index and 0 <= self._index_at <= c.height
+                and self._index_tip
+                and c.blocks[self._index_at].block_id == self._index_tip):
+            start = self._index_at + 1      # same branch, just longer
+        else:
+            self._tx_index, self._block_index, self._addr_index = {}, {}, {}
+
+        for b in c.blocks[start:]:
+            self._block_index[b.block_id] = b.height
             for tx in b.transactions:
-                tx_idx[tx.txid] = (b.height, tx)
-        self._tx_index, self._block_index = tx_idx, blk_idx
-        self._index_at = self.chain.height
+                self._tx_index[tx.txid] = (b.height, tx)
+        # addresses in a second pass: an input's address can only be
+        # resolved once the transaction that created it is in _tx_index
+        for b in c.blocks[start:]:
+            for tx in b.transactions:
+                for addr, delta in self._deltas_of(tx).items():
+                    self._addr_index.setdefault(addr, []).append(
+                        (b.height, tx.txid, delta, tx.is_coinbase,
+                         tx.timestamp))
+        self._index_at, self._index_tip = c.height, c.tip.block_id
+
+    def _deltas_of(self, tx: Transaction) -> dict:
+        """How much this transaction moves for each address it touches."""
+        deltas: dict[str, int] = {}
+        for o in tx.outputs:
+            deltas[o.address] = deltas.get(o.address, 0) + o.amount
+        if not tx.is_coinbase:
+            for i in tx.inputs:
+                got = self._resolve_output(i.txid, i.vout)
+                if got:
+                    amt, addr = got
+                    deltas[addr] = deltas.get(addr, 0) - amt
+        return {a: d for a, d in deltas.items() if d}
 
     def _resolve_output(self, txid: str, vout: int):
         """(amount, address) of a previously created output, or None."""
@@ -788,6 +894,10 @@ class Node:
             view["status"] = "confirmed"
         else:
             view["status"] = "mempool"
+            age = c.mempool_age(tx.txid)
+            view["first_seen"] = c.mempool_seen.get(tx.txid)
+            view["age_seconds"] = round(age, 1)
+            view["expires_in"] = round(max(MEMPOOL_TTL - age, 0), 1)
         return view
 
     def _block_view(self, block: Block, full: bool = False) -> dict:
@@ -868,41 +978,58 @@ class Node:
             "avg_block_time": avg,
         }
 
-    def _address_view(self, addr: str) -> dict:
+    def _address_view(self, addr: str, limit: int = 50) -> dict:
+        """Everything a wallet needs about one address, in one request.
+
+        Including the pending payments: a wallet used to ask for this and
+        then ask for the whole mempool separately, which meant its idea of
+        "confirmed" and its idea of "on the way" came from two different
+        moments and could disagree — a payment could be in neither, and
+        vanish from the screen, or in both, and be counted twice.
+        """
         from .crypto_utils import is_valid_address
         c = self.chain
         if not is_valid_address(addr):
-            return {"address": addr, "valid": False}
+            return {"address": addr, "valid": False,
+                    "error": "not a Kestrel address"}
         bal = c.balance(addr)
         utxos = c.utxos_for(addr, spendable_only=False)
-        received = sent = 0
-        history = []
-        for b in c.blocks:
-            for tx in b.transactions:
-                delta = 0
-                for o in tx.outputs:
-                    if o.address == addr:
-                        delta += o.amount
-                        received += o.amount
-                if not tx.is_coinbase:
-                    for i in tx.inputs:
-                        got = self._resolve_output(i.txid, i.vout)
-                        if got and got[1] == addr:
-                            delta -= got[0]
-                            sent += got[0]
-                if delta != 0:
-                    history.append({
-                        "txid": tx.txid,
-                        "height": b.height,
-                        "timestamp": tx.timestamp,
-                        "delta": delta,
-                        "delta_ksl": format_ksl(delta),
-                        "coinbase": tx.is_coinbase,
-                    })
-        history.reverse()
+        entries = self._addr_index.get(addr, ())
+        received = sum(d for _h, _t, d, _cb, _ts in entries if d > 0)
+        sent = -sum(d for _h, _t, d, _cb, _ts in entries if d < 0)
+        history = [
+            {"txid": txid, "height": h, "timestamp": ts, "delta": d,
+             "delta_ksl": format_ksl(d), "coinbase": cb,
+             "confirmations": self._confirmations(h)}
+            for h, txid, d, cb, ts in reversed(entries[-limit:])
+        ]
+
+        now = time.time()
+        pending = []
+        for txid, tx in c.mempool.items():
+            deltas = self._deltas_of(tx)
+            if addr not in deltas:
+                continue
+            age = c.mempool_age(txid, now=now)
+            pending.append({
+                "txid": txid,
+                "timestamp": tx.timestamp,
+                "delta": deltas[addr],
+                "delta_ksl": format_ksl(deltas[addr]),
+                "outgoing": deltas[addr] < 0,
+                "first_seen": c.mempool_seen.get(txid, now),
+                "age_seconds": round(age, 1),
+                # how long it may still wait before this node gives up
+                "expires_in": round(max(MEMPOOL_TTL - age, 0), 1),
+            })
+        pending.sort(key=lambda p: -p["first_seen"])
+        p_in = sum(p["delta"] for p in pending if p["delta"] > 0)
+        p_out = -sum(p["delta"] for p in pending if p["delta"] < 0)
+
         return {
             "address": addr,
             "valid": True,
+            "height": c.height,
             "confirmed": bal["confirmed"],
             "confirmed_ksl": format_ksl(bal["confirmed"]),
             "spendable": bal["spendable"],
@@ -911,9 +1038,15 @@ class Node:
             "received_ksl": format_ksl(received),
             "sent": sent,
             "sent_ksl": format_ksl(sent),
-            "tx_count": len(history),
+            "tx_count": len(entries),
             "utxos": [{**u, "amount_ksl": format_ksl(u["amount"])} for u in utxos],
-            "history": history[:50],
+            "history": history,
+            "pending": pending,
+            "pending_in": p_in,
+            "pending_in_ksl": format_ksl(p_in),
+            "pending_out": p_out,
+            "pending_out_ksl": format_ksl(p_out),
+            "mempool_ttl": MEMPOOL_TTL,
         }
 
     def _richlist(self, n: int = 20) -> list[dict]:
@@ -1029,16 +1162,34 @@ class Node:
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
                 self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
+            # The response is BUILT here and SENT after the handler has
+            # returned — see do_GET/do_POST below. Writing from inside the
+            # handler meant writing to the socket while still holding
+            # node.lock, and wfile is unbuffered, so the write blocks until
+            # the client drains it. One slow or stalled reader asking for
+            # /chain therefore froze mining, block acceptance and every
+            # other request for as long as it cared to take.
             def _raw(self, body: bytes, content_type: str, status=200):
-                self.send_response(status)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(body)))
-                self._cors()
-                self.end_headers()
-                self.wfile.write(body)
+                self._out = (status, content_type, body)
 
             def _send(self, obj, status=200):
                 self._raw(json.dumps(obj).encode(), "application/json", status)
+
+            def _flush(self):
+                """Actually write the response. Never called under a lock."""
+                out, self._out = getattr(self, "_out", None), None
+                if out is None:
+                    return
+                status, content_type, body = out
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(body)))
+                    self._cors()
+                    self.end_headers()
+                    self.wfile.write(body)
+                except OSError:
+                    pass          # client hung up mid-response; not our problem
 
             def _body(self) -> dict:
                 try:
@@ -1066,6 +1217,12 @@ class Node:
 
             # ----------------------------------------------------------- GET
             def do_GET(self):
+                try:
+                    self._route_get()
+                finally:
+                    self._flush()
+
+            def _route_get(self):
                 path, _, query = self.path.partition("?")
                 if path == "/":
                     # A browser gets the live dashboard; API clients (curl,
@@ -1152,7 +1309,8 @@ class Node:
                             return self._send(node._tx_view(c.mempool[parts[1]]))
                         return self._send({"error": "no such transaction"}, 404)
                     if len(parts) == 2 and parts[0] == "address":
-                        return self._send(node._address_view(parts[1]))
+                        n = qint(query, "n", 50, 1, 500)
+                        return self._send(node._address_view(parts[1], n))
                     if len(parts) == 2 and parts[0] == "balance":
                         return self._send(c.balance(parts[1]))
                     if len(parts) == 2 and parts[0] == "utxos":
@@ -1168,6 +1326,7 @@ class Node:
                             "txids": list(c.mempool),
                             "transactions": txs,
                             "raw": [t.to_dict() for t in c.mempool.values()],
+                            "ttl_seconds": MEMPOOL_TTL,
                         })
                     if path == "/peers":
                         return self._send({
@@ -1181,6 +1340,12 @@ class Node:
             # ---------------------------------------------------------- POST
             def do_POST(self):
                 try:
+                    self._route_post()
+                finally:
+                    self._flush()
+
+            def _route_post(self):
+                try:
                     body = self._body()
                 except json.JSONDecodeError:
                     return self._send({"error": "bad json"}, 400)
@@ -1189,8 +1354,18 @@ class Node:
                     if self.path == "/tx":
                         tx = Transaction.from_dict(body["tx"])
                         with node.lock:
-                            txid = c.add_transaction(tx)
-                            c.save()
+                            # the person at this machine retrying a payment
+                            # outranks our own "we gave up on that one"
+                            txid = c.add_transaction(
+                                tx, allow_readmit=self._is_loopback())
+                            try:
+                                c.save()
+                            except OSError as e:
+                                # it is in the mempool and about to be
+                                # gossiped; a disk that won't take the
+                                # copy must not read as "payment failed"
+                                logfile.write(f"could not write the mempool "
+                                              f"to disk ({e})", level="warn")
                         node.broadcast("/tx", {"tx": tx.to_dict()})
                         return self._send({"accepted": True, "txid": txid})
 
@@ -1373,21 +1548,28 @@ class Node:
 
         shown = "127.0.0.1" if self.host in ("0.0.0.0", "") else self.host
         base = f"http://{shown}:{self.port}"
-        print(f"\nKestrel node listening on http://{self.host}:{self.port}  "
-              f"(height {self.chain.height}, {len(self.peers)} known peers)")
-        print(f"  Dashboard  {base}/   (open in a browser)")
-        print(f"  JSON API   {base}/info  ·  {base}/supply")
+        # console() prints where there is a console and nothing where
+        # there isn't — in a windowed app this all went over whatever the
+        # person had open in the terminal behind it
+        logfile.console(
+            f"\nKestrel node listening on http://{self.host}:{self.port}  "
+            f"(height {self.chain.height}, {len(self.peers)} known peers)")
+        logfile.console(f"  Dashboard  {base}/   (open in a browser)")
+        logfile.console(f"  JSON API   {base}/info  ·  {base}/supply")
+        logfile.write(f"node listening on {self.host}:{self.port} "
+                      f"(height {self.chain.height})")
 
         # zero-config networking: LAN + worldwide discovery + seeds + loops
         self.discovery.start()
         if self.discovery.active:
-            print("  LAN auto-discovery on — nodes on this network "
-                  "will find each other")
+            logfile.console("  LAN auto-discovery on — nodes on this network "
+                            "will find each other")
         self.rendezvous.start()
         if self.rendezvous.started:
-            print("  Worldwide auto-discovery on — announcing on the public "
-                  "DHT so\n  Kestrel nodes anywhere on the internet find "
-                  "each other")
+            logfile.console(
+                "  Worldwide auto-discovery on — announcing on the public "
+                "DHT so\n  Kestrel nodes anywhere on the internet find "
+                "each other")
         threading.Thread(target=self.bootstrap, daemon=True).start()
         threading.Thread(target=self._sync_loop, daemon=True).start()
         threading.Thread(target=self._announce_loop, daemon=True).start()
