@@ -26,6 +26,7 @@ from kestrel.blockchain import Blockchain
 from kestrel.wallet import Wallet
 from kestrel.node import Node
 from kestrel import params
+from kestrel.miner import mine
 
 
 def _get(url, t=5):
@@ -161,3 +162,109 @@ class TwoNodeNetwork(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAddressIndex(unittest.TestCase):
+    """The address view: one request, one consistent moment, and cheap.
+
+    It used to walk every block in the chain on every call, holding the
+    node lock while it did — so a wallet asking for its balance every few
+    seconds got slower with every block mined. It also answered only about
+    confirmed history, leaving the wallet to ask separately what was still
+    in flight; two questions asked at two different moments can disagree,
+    and a payment could appear in both answers or in neither.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.chain = Blockchain(data_dir=self.tmp, autoload=False)
+        self.alice, self.bob = Wallet.create(), Wallet.create()
+        mine(self.chain, self.alice.address, count=2, quiet=True)
+        mine(self.chain, Wallet.create().address,
+             count=params.COINBASE_MATURITY, quiet=True)
+        self.node = Node(self.chain, host="127.0.0.1",
+                         port=params.DEFAULT_PORT + 70)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def view(self, addr):
+        with self.node.lock:
+            self.node._reindex()
+            return self.node._address_view(addr)
+
+    def test_mined_coins_appear_in_history(self):
+        v = self.view(self.alice.address)
+        self.assertTrue(v["valid"])
+        self.assertEqual(v["tx_count"], 2)
+        self.assertTrue(all(h["coinbase"] for h in v["history"]))
+        self.assertEqual(v["confirmed"], 2 * params.INITIAL_REWARD)
+
+    def test_pending_comes_back_in_the_same_answer(self):
+        utxos = self.chain.utxos_for(self.alice.address, spendable_only=True)
+        tx = self.alice.build_transaction(utxos, self.bob.address,
+                                          params.COIN, params.MIN_RELAY_FEE)
+        self.chain.add_transaction(tx)
+
+        v = self.view(self.bob.address)
+        self.assertEqual(len(v["pending"]), 1)
+        self.assertEqual(v["pending"][0]["delta"], params.COIN)
+        self.assertFalse(v["pending"][0]["outgoing"])
+        self.assertEqual(v["pending_in"], params.COIN)
+        self.assertEqual(v["confirmed"], 0)          # not a block yet
+        self.assertIn("age_seconds", v["pending"][0])
+        self.assertIn("expires_in", v["pending"][0])
+
+        # and the sender sees it as going out, in the same one call
+        s = self.view(self.alice.address)
+        self.assertTrue(s["pending"][0]["outgoing"])
+        self.assertGreater(s["pending_out"], 0)
+
+    def test_pending_becomes_history_once_mined(self):
+        utxos = self.chain.utxos_for(self.alice.address, spendable_only=True)
+        tx = self.alice.build_transaction(utxos, self.bob.address,
+                                          params.COIN, params.MIN_RELAY_FEE)
+        self.chain.add_transaction(tx)
+        mine(self.chain, self.alice.address, count=1, quiet=True)
+
+        v = self.view(self.bob.address)
+        self.assertEqual(v["pending"], [])
+        self.assertEqual(v["confirmed"], params.COIN)
+        self.assertEqual(v["history"][0]["txid"], tx.txid)
+        self.assertEqual(v["history"][0]["confirmations"], 1)
+
+    def test_index_extends_instead_of_rebuilding(self):
+        """The whole point: a new block must not re-walk the whole chain."""
+        with self.node.lock:
+            self.node._reindex()
+        first = self.node._tx_index
+        mine(self.chain, self.alice.address, count=1, quiet=True)
+        with self.node.lock:
+            self.node._reindex()
+        self.assertIs(self.node._tx_index, first)     # same dict, extended
+        self.assertEqual(self.node._index_at, self.chain.height)
+        self.assertEqual(self.node._index_tip, self.chain.tip.block_id)
+
+    def test_index_is_rebuilt_after_a_reorg(self):
+        blocks = [b.to_dict() for b in self.chain.blocks]
+        mine(self.chain, self.alice.address, count=1, quiet=True)
+        with self.node.lock:
+            self.node._reindex()
+        stale_tip = self.node._index_tip
+
+        rival = Blockchain.from_block_dicts(blocks, data_dir=self.tmp)
+        mine(rival, self.bob.address, count=2, quiet=True)
+        self.assertTrue(self.chain.maybe_replace(
+            [b.to_dict() for b in rival.blocks]))
+        with self.node.lock:
+            self.node._reindex()
+
+        self.assertNotEqual(self.node._index_tip, stale_tip)
+        self.assertEqual(self.node._index_tip, self.chain.tip.block_id)
+        # history must reflect the chain that actually won
+        self.assertEqual(self.view(self.bob.address)["tx_count"], 2)
+
+    def test_an_unknown_address_is_answered_not_crashed(self):
+        v = self.view("not-an-address")
+        self.assertFalse(v["valid"])
+        self.assertIn("error", v)
