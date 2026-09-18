@@ -18,6 +18,7 @@ import urllib.error
 import urllib.request
 
 from . import params
+from . import logfile
 from .blockchain import Blockchain, ValidationError
 from .wallet import Wallet, format_ksl, parse_ksl
 from .miner import mine
@@ -69,6 +70,8 @@ def local_node() -> str | None:
 
 
 def main(argv=None):
+    # on the command line the console IS the log; keep it talking
+    logfile.setup(os.getcwd(), "cli", quiet=False)
     p = argparse.ArgumentParser(prog="kestrel", description="Kestrel (KSL) node & wallet")
     p.add_argument("--data-dir", default=None, help="chain data directory")
     p.add_argument("--wallet", default=WALLET_FILE, help="wallet file path")
