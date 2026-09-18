@@ -34,12 +34,15 @@ for cand in (_HERE, os.path.abspath(os.path.join(_HERE, "..", ".."))):
         sys.path.insert(0, cand)
         break
 
-from kestrel import params, announcements, __version__ as KVER  # noqa: E402
+from kestrel import params, announcements, updates, ui           # noqa: E402
+from kestrel import __version__ as KVER                          # noqa: E402
 from kestrel.wallet import Wallet, format_ksl, parse_ksl      # noqa: E402
 from kestrel.crypto_utils import is_valid_address, private_to_wif  # noqa: E402
 from kestrel.blockchain import Blockchain, ValidationError    # noqa: E402
 from kestrel.node import Node                                 # noqa: E402
+from kestrel import logfile                                   # noqa: E402
 from kestrel.discovery import load_seed_nodes, get_lan_ip     # noqa: E402
+from kestrel.blockchain import MEMPOOL_TTL                    # noqa: E402
 
 
 def _enable_dpi():
@@ -67,68 +70,43 @@ SETTINGS_FILE = os.path.join(_HERE, "wallet-settings.json")
 DATA_DIR = os.path.join(_HERE, "kestrel-data")
 PORTS = tuple(params.DEFAULT_PORT + i for i in range(10))
 
-# ------------------------------------------------------------------ palette
-DUSK, DUSK2, DUSK3, SPOT = "#1B212C", "#222A38", "#2A3444", "#10141B"
-RAIL = "#141924"
-BUFF, MUTED, FAINT = "#EAE1CE", "#A79F8D", "#736c5e"
-RUFOUS, RUFOUS_HI = "#C4552A", "#DB6636"
-GREEN, RED, SLATE = "#5FA46A", "#C15b4b", "#8CA7C4"
-AMBER = "#D9A441"
-ZEBRA = "#131822"
-HOVER = "#33405A"
+# How often a running app re-checks the announcement feed. It also checks
+# once on startup, so this only governs long-lived sessions.
+ANNOUNCE_EVERY_MS = 25 * 60 * 1000
 
-# Fonts are resolved per-platform once a Tk root exists (see _resolve_fonts).
-SANS = ("Segoe UI", 10)
-SANS_B = ("Segoe UI", 10, "bold")
-SANS_9 = ("Segoe UI", 9)
-SANS_9B = ("Segoe UI", 9, "bold")
-TINY = ("Segoe UI", 8)
-TINY_B = ("Segoe UI", 8, "bold")
-MICRO_B = ("Segoe UI", 7, "bold")
-TITLE = ("Segoe UI", 16, "bold")
-BRAND = ("Segoe UI", 14, "bold")
-MONO = ("Consolas", 10)
-MONO_8 = ("Consolas", 8)
-MONO_9 = ("Consolas", 9)
-MONO_11B = ("Consolas", 11, "bold")
-MONO_12 = ("Consolas", 12)
-MONO_13 = ("Consolas", 13)
-MONO_26B = ("Consolas", 26, "bold")
+# ------------------------------------------------------------------ theme
+# Palette, type scale and widgets all live in kestrel/ui.py now, shared
+# with the Miner so the two apps cannot drift apart again. The names below
+# are local shorthands for it, nothing more.
+DUSK, DUSK2, DUSK3, SPOT = ui.SURFACE, ui.CARD, ui.CARD_HI, ui.SUNK
+RAIL, INK = ui.RAIL, ui.INK
+BUFF, MUTED, FAINT = ui.TEXT, ui.TEXT_DIM, ui.TEXT_FAINT
+RUFOUS, RUFOUS_HI = ui.RUFOUS, ui.RUFOUS_HI
+GREEN, RED, SLATE = ui.GREEN, ui.RED, ui.SLATE
+AMBER, ZEBRA, HOVER = ui.AMBER, ui.ZEBRA, ui.FOCUS
+LINE, LINE_SOFT = ui.LINE, ui.LINE_SOFT
+
+# Font tuples, refreshed by _resolve_fonts once a Tk root exists.
+SANS = SANS_B = SANS_9 = SANS_9B = TINY = TINY_B = MICRO_B = ("", 10)
+TITLE = BRAND = MONO = MONO_8 = MONO_9 = MONO_11B = ("", 10)
+MONO_12 = MONO_13 = MONO_26B = LEAD = H2 = ("", 10)
 
 
-def _resolve_fonts(root):
-    """Pick the best available family per platform and rebuild font tuples."""
+def _resolve_fonts(root, scale=1.0):
+    """Resolve the shared type scale, then republish it under local names."""
     global SANS, SANS_B, SANS_9, SANS_9B, TINY, TINY_B, MICRO_B, TITLE, BRAND
     global MONO, MONO_8, MONO_9, MONO_11B, MONO_12, MONO_13, MONO_26B
-    try:
-        fams = set(tkfont.families(root))
-    except Exception:
-        return
-    sans = next((f for f in ("Segoe UI", "SF Pro Text", "Helvetica Neue",
-                             "DejaVu Sans", "Arial") if f in fams),
-                "TkDefaultFont")
-    mono = next((f for f in ("Cascadia Mono", "Consolas", "SF Mono", "Menlo",
-                             "DejaVu Sans Mono", "Courier New") if f in fams),
-                "TkFixedFont")
-    SANS = (sans, 10)
-    SANS_B = (sans, 10, "bold")
-    SANS_9 = (sans, 9)
-    SANS_9B = (sans, 9, "bold")
-    TINY = (sans, 8)
-    TINY_B = (sans, 8, "bold")
-    MICRO_B = (sans, 7, "bold")
-    TITLE = (sans, 16, "bold")
-    BRAND = (sans, 14, "bold")
-    MONO = (mono, 10)
-    MONO_8 = (mono, 8)
-    MONO_9 = (mono, 9)
-    MONO_11B = (mono, 11, "bold")
-    MONO_12 = (mono, 12)
-    MONO_13 = (mono, 13)
-    MONO_26B = (mono, 26, "bold")
+    global LEAD, H2
+    F = ui.resolve_fonts(root, scale)
+    SANS, SANS_B = F["body"], F["body_b"]
+    SANS_9, SANS_9B = F["small"], F["small_b"]
+    TINY, TINY_B, MICRO_B = F["tiny"], F["tiny_b"], F["micro"]
+    TITLE, BRAND, LEAD, H2 = F["h1"], F["brand"], F["lead"], F["h2"]
+    MONO, MONO_8, MONO_9 = F["mono"], F["mono_tiny"], F["mono_small"]
+    MONO_11B, MONO_12, MONO_13 = F["mono_b"], F["mono_lead"], F["mono_lead_b"]
+    MONO_26B = F["mono_huge"]
 
 
-# ------------------------------------------------------------------ helpers
 def http_json(method, url, payload=None, timeout=10):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, method=method,
@@ -538,111 +516,20 @@ def qr_matrix(text):
     return best
 
 
-class Tooltip:
-    """Small hover hint for any widget."""
-
-    def __init__(self, widget, text, delay=550):
-        self.w, self.text, self.delay = widget, text, delay
-        self.tip = None
-        self._id = None
-        widget.bind("<Enter>", self._schedule, add="+")
-        widget.bind("<Leave>", self._hide, add="+")
-        widget.bind("<ButtonPress>", self._hide, add="+")
-
-    def _schedule(self, _e=None):
-        self._cancel()
-        self._id = self.w.after(self.delay, self._show)
-
-    def _cancel(self):
-        if self._id:
-            self.w.after_cancel(self._id)
-            self._id = None
-
-    def _show(self):
-        if self.tip or not self.text:
-            return
-        x = self.w.winfo_rootx() + 12
-        y = self.w.winfo_rooty() + self.w.winfo_height() + 6
-        self.tip = tk.Toplevel(self.w)
-        self.tip.wm_overrideredirect(True)
-        self.tip.wm_geometry(f"+{x}+{y}")
-        f = tk.Frame(self.tip, bg=DUSK3)
-        f.pack()
-        tk.Label(f, text=self.text, bg="#0C0F14", fg=BUFF,
-                 font=SANS_9, justify="left", relief="flat",
-                 padx=10, pady=6, wraplength=320).pack(padx=1, pady=1)
-        try:
-            self.tip.attributes("-topmost", True)
-        except Exception:
-            pass
-
-    def _hide(self, _e=None):
-        self._cancel()
-        if self.tip:
-            self.tip.destroy()
-            self.tip = None
+Tooltip = ui.Tooltip
+Toasts = ui.Toasts
 
 
-class Toasts:
-    """Non-blocking notifications, bottom-right, click to dismiss."""
-
-    def __init__(self, root):
-        self.root = root
-        self.items = []
-
-    def show(self, text, kind="info", ms=4500):
-        edge = {"good": GREEN, "bad": RED, "warn": AMBER}.get(kind, SLATE)
-        f = tk.Frame(self.root, bg=SPOT, highlightbackground=edge,
-                     highlightthickness=1)
-        tk.Frame(f, bg=edge, width=3).pack(side="left", fill="y")
-        tk.Label(f, text=text, bg=SPOT, fg=BUFF, font=SANS_9, padx=12,
-                 pady=8, wraplength=380, justify="left").pack(side="left")
-        x = tk.Label(f, text="✕", bg=SPOT, fg=FAINT, font=TINY, padx=8,
-                     cursor="hand2")
-        x.pack(side="right", fill="y")
-        for w in (f, x):
-            w.bind("<Button-1>", lambda _e, ff=f: self.close(ff))
-        self.items.append(f)
-        self._layout()
-        self.root.after(ms, lambda: self.close(f))
-
-    def close(self, f):
-        if f in self.items:
-            self.items.remove(f)
-        try:
-            f.destroy()
-        except Exception:
-            pass
-        self._layout()
-
-    def _layout(self):
-        while len(self.items) > 4:
-            self.close(self.items[0])
-        try:
-            self.root.update_idletasks()
-        except Exception:
-            pass
-        y = -44
-        for f in reversed(self.items):
-            f.place(relx=1.0, rely=1.0, x=-14, y=y, anchor="se")
-            f.lift()
-            y -= max(f.winfo_reqheight(), 36) + 8
-
-
-
-# How often a running app re-checks the announcement feed. It also checks
-# once on startup, so this only governs long-lived sessions. Kept modest:
-# it is a small text file on a CDN, and 25 minutes is roughly 58 requests
-# a day per app.
-ANNOUNCE_EVERY_MS = 25 * 60 * 1000
-
-class App(tk.Tk):
+class App(ui.Resilient, tk.Tk):
     VIEWS = ("Overview", "Send", "Receive", "Transactions", "Contacts")
     ICONS = {"Overview": "◈", "Send": "↑", "Receive": "↓",
              "Transactions": "☰", "Contacts": "❖"}
 
     def __init__(self):
         super().__init__()
+        # Diagnostics go to kestrel-log.txt beside the app, and the
+        # console stays clean — see kestrel/logfile.py.
+        logfile.setup(_HERE, "wallet", quiet=True)
         _resolve_fonts(self)
         self.title(f"Kestrel Wallet {KVER}")
         self.configure(bg=DUSK)
@@ -660,6 +547,12 @@ class App(tk.Tk):
         self._avail = 0
         self._history = []
         self._pending = []
+        self._ttl = MEMPOOL_TTL
+        self._last_ok = time.time()   # when the balance last really loaded
+        self._stale_why = None
+        self._old_node_warned = False
+        self._update_rel = None       # the newer release, once we know of one
+        self._updating = False
         self._rows = []
         self.book = self._load_book()
         self.embedded = None  # our own node, if we had to start one
@@ -671,10 +564,9 @@ class App(tk.Tk):
         self._build_ui()
         self._bind_keys()
         self._ensure_wallet()
-        self.after(150, self._drain_queue)
         threading.Thread(target=self._auto_node, daemon=True).start()
-        self._poll()
-        self._auto_refresh()
+        self._start_loops()
+        self._check_updates()
         self.protocol("WM_DELETE_WINDOW", self._quit)
 
     # ------------------------------------------------------------ window
@@ -696,6 +588,14 @@ class App(tk.Tk):
             self.geometry("1000x680")
 
     def _make_icon(self):
+        """The real Kestrel mark in the title bar and the taskbar.
+
+        Falls back to the hand-drawn shape if Tk cannot take a PNG, so a
+        cosmetic feature can never stop the app opening.
+        """
+        self._icon_img = ui.app_icon(self)
+        if self._icon_img:
+            return
         try:
             img = tk.PhotoImage(width=32, height=32)
             img.put(DUSK2, to=(0, 0, 32, 32))
@@ -718,6 +618,26 @@ class App(tk.Tk):
 
     def toast(self, text, kind="info"):
         self.toasts.show(text, kind)
+
+    def on_internal_error(self, where, exc):
+        """Say something went wrong, once, without a wall of Python.
+
+        Silent failure is what made the last round of bugs so hard to
+        pin down: the app looked fine and simply stopped finding things
+        out. One quiet line is enough to tell someone their log is worth
+        a look, and Resilient only calls this the first time each
+        distinct failure happens, so it can never become a drumbeat.
+        """
+        if getattr(self, "_telling", False):
+            return          # the failure was in here: don't chase our tail
+        self._telling = True
+        try:
+            self.toast("Something went wrong inside the app — it kept "
+                       "going. Details are in kestrel-log.txt.", "warn")
+        except Exception:
+            pass
+        finally:
+            self._telling = False
 
     # ---------------------------------------------------- zero-setup start
     def _ensure_wallet(self):
@@ -772,20 +692,7 @@ class App(tk.Tk):
 
     # -------------------------------------------------------------- theming
     def _init_style(self):
-        s = ttk.Style(self)
-        s.theme_use("clam")
-        s.configure("KV.Treeview", background=SPOT, fieldbackground=SPOT,
-                    foreground=BUFF, bordercolor=DUSK3, borderwidth=0,
-                    rowheight=28, font=SANS_9)
-        s.configure("KV.Treeview.Heading", background=DUSK3, foreground=MUTED,
-                    font=TINY_B, relief="flat", padding=6)
-        s.map("KV.Treeview", background=[("selected", DUSK3)],
-              foreground=[("selected", BUFF)])
-        s.map("KV.Treeview.Heading", background=[("active", HOVER)])
-        s.configure("KV.Vertical.TScrollbar", background=DUSK3,
-                    troughcolor=SPOT, bordercolor=SPOT, arrowcolor=MUTED,
-                    relief="flat", gripcount=0)
-        s.map("KV.Vertical.TScrollbar", background=[("active", HOVER)])
+        ui.init_style(self)
 
     def _attach_edit_menu(self, w):
         """Right-click Cut/Copy/Paste/Select-all on an Entry + Ctrl+A."""
@@ -813,11 +720,8 @@ class App(tk.Tk):
                lambda e: (w.select_range(0, "end"), "break")[1])
         return w
 
-    def _entry(self, parent, **kw):
-        e = tk.Entry(parent, bg=SPOT, fg=BUFF, insertbackground=BUFF,
-                     relief="flat", font=MONO, highlightthickness=1,
-                     highlightbackground=DUSK3, highlightcolor=SLATE, **kw)
-        return self._attach_edit_menu(e)
+    def _entry(self, parent, f="mono", **kw):
+        return self._attach_edit_menu(ui.entry(parent, f=f, **kw))
 
     def _placeholder(self, e, text):
         """Grey hint text inside an Entry that clears itself on focus."""
@@ -893,6 +797,190 @@ class App(tk.Tk):
         top.wait_window()
         return out["value"]
 
+    # --------------------------------------------------------------- updates
+    #
+    # Ask, then do it. The app checks quietly in the background; if there
+    # is something newer it says what changed and waits. Nothing is
+    # downloaded before the person says yes, the download is checked
+    # against the checksum published with the release before anything is
+    # replaced, and the wallet file, the address book, settings and the
+    # ledger are never touched by any of it.
+
+    def _check_updates(self, *, manual=False):
+        if not manual and not self.settings.get("check_updates", True):
+            return
+        updates.cleanup(_HERE)
+        if manual:
+            self.toast("Checking for a newer version…")
+
+        def done(rel):
+            self.q.put(("update", rel, manual))
+
+        def run():
+            rel = updates.fetch_latest()
+            if rel and updates.is_newer(rel["version"]):
+                self.q.put(("update", rel, manual))
+            elif manual:
+                self.q.put(("toast", f"You're on the newest version "
+                                     f"({KVER}).", "good"))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_update_available(self, rel, manual=False):
+        self._update_rel = rel
+        self._show_update_chip(rel)
+        # Prompt once per version. Saying no should mean no until there is
+        # something new to say, not "ask me again in ten minutes".
+        if manual or self.settings.get("update_prompted") != rel["version"]:
+            self.settings["update_prompted"] = rel["version"]
+            save_settings(self.settings)
+            self._update_dialog(rel)
+
+    def _update_dialog(self, rel):
+        can, why = updates.can_install(_HERE)
+        top = self._dialog(f"Kestrel {rel['version']} is available")
+        tk.Frame(top, bg=RUFOUS, height=3).pack(fill="x")
+        body = tk.Frame(top, bg=DUSK2, padx=24, pady=20)
+        body.pack(fill="both", expand=True)
+
+        tk.Label(body, text=f"Kestrel {rel['version']} is available",
+                 bg=DUSK2, fg=BUFF, font=H2, anchor="w").pack(fill="x")
+        tk.Label(body, text=f"You have {KVER}.", bg=DUSK2, fg=FAINT,
+                 font=SANS_9, anchor="w").pack(fill="x", pady=(2, 0))
+
+        bullets = updates.summarize(rel.get("notes", ""))
+        if bullets:
+            box = tk.Frame(body, bg=SPOT)
+            box.pack(fill="x", pady=(14, 0))
+            for line in bullets:
+                tk.Label(box, text="•  " + line, bg=SPOT, fg=MUTED,
+                         font=SANS_9, anchor="w", justify="left",
+                         wraplength=430).pack(fill="x", padx=14,
+                                              pady=(7 if line is bullets[0]
+                                                    else 1, 0))
+            tk.Frame(box, bg=SPOT, height=8).pack(fill="x")
+
+        tk.Label(body, text=(
+            "Your wallet file, address book, settings and ledger are left "
+            "exactly as they are. The previous version is kept until the "
+            "new one starts." if can else why),
+            bg=DUSK2, fg=MUTED if can else AMBER, font=SANS_9, anchor="w",
+            justify="left", wraplength=450).pack(fill="x", pady=(14, 0))
+
+        self._up_status = tk.StringVar(value="")
+        st = tk.Label(body, textvariable=self._up_status, bg=DUSK2, fg=SLATE,
+                      font=SANS_9, anchor="w")
+        self._up_meter = ui.Meter(body, bg=DUSK2)
+
+        row = tk.Frame(body, bg=DUSK2)
+        row.pack(fill="x", pady=(20, 0))
+        cancel = threading.Event()
+
+        def close():
+            cancel.set()
+            top.destroy()
+
+        def later():
+            close()
+
+        def never():
+            self.settings["check_updates"] = False
+            save_settings(self.settings)
+            # keep the menu tick in step with the choice made here
+            try:
+                self.updates_on.set(False)
+            except Exception:
+                pass
+            self.toast("Update checks turned off — Settings ▸ Check for "
+                       "new versions turns them back on.")
+            close()
+
+        def go():
+            self._updating = True
+            go_btn.configure(state="disabled", text="Updating…")
+            later_btn.configure(state="disabled")
+            st.pack(fill="x", pady=(14, 6), before=row)
+            self._up_meter.pack(fill="x", before=row)
+            self._up_meter.start()
+            threading.Thread(target=work, daemon=True).start()
+
+        def work():
+            try:
+                updates.install(
+                    rel, "kestrel-wallet", _HERE, os.path.abspath(__file__),
+                    on_step=lambda m: self.q.put(("upstep", m)),
+                    on_progress=lambda got, tot: self.q.put(
+                        ("upprog", got, tot)),
+                    cancel=cancel)
+                self.q.put(("upok",))
+            except Exception as e:
+                self.q.put(("upfail", str(e)))
+
+        go_btn = ui.button(row, "Update and restart", go, kind="primary")
+        if can:
+            go_btn.pack(side="left")
+        later_btn = ui.button(row, "Not now", later, bg_of=DUSK2)
+        later_btn.pack(side="left", padx=(ui.PAD_S, 0))
+        self._linkbtn(row, "Open the downloads page",
+                      lambda: self._say("Downloads",
+                                        "Open this in your browser:",
+                                        link=rel.get("url")),
+                      bg=DUSK2).pack(side="left", padx=(ui.PAD_S, 0))
+        self._linkbtn(row, "Never check", never,
+                      bg=DUSK2).pack(side="right")
+        top.protocol("WM_DELETE_WINDOW", close)
+        top.bind("<Escape>", lambda _e: close())
+        self._present_dialog(top, modal=False)
+        self._up_dialog = top
+
+    def _show_update_chip(self, rel):
+        """A quiet way back to the update once the dialog has been closed."""
+        if not hasattr(self, "update_chip"):
+            return
+        self.update_chip.configure(
+            text=f"  ⬆  Update to {rel['version']}  ",
+            command=lambda: self._update_dialog(rel))
+        if not self.update_chip.winfo_ismapped():
+            self.update_chip.pack(fill="x", pady=(0, ui.PAD_S))
+
+    def _update_step(self, msg):
+        if hasattr(self, "_up_status"):
+            self._up_status.set(msg)
+
+    def _update_progress(self, got, total):
+        if not hasattr(self, "_up_meter"):
+            return
+        if total:
+            self._up_meter.set(got / total)
+            self._update_step(f"Downloading… {got / 1e6:.1f} of "
+                              f"{total / 1e6:.1f} MB")
+        else:
+            self._update_step(f"Downloading… {got / 1e6:.1f} MB")
+
+    def _update_done(self):
+        self._update_step("Restarting Kestrel…")
+        self.toast("Update installed — Kestrel is restarting.", "good")
+        self.after(900, self._quit)
+
+    def _update_failed(self, why):
+        self._updating = False
+        if hasattr(self, "_up_meter"):
+            self._up_meter.stop()
+        try:
+            self._up_dialog.destroy()
+        except Exception:
+            pass
+        self._error("Update failed",
+                    f"{why}\n\nNothing was changed — you are still running "
+                    f"{KVER}. You can download the new version yourself "
+                    f"from the releases page.")
+
+    def _toggle_update_checks(self):
+        on = bool(self.updates_on.get())
+        self.settings["check_updates"] = on
+        save_settings(self.settings)
+        if on:
+            self._check_updates(manual=True)
+
     # --------------------------------------------------------------- dialogs
 
     def _modal(self, title, message, kind="info", ok="OK", cancel=None,
@@ -967,102 +1055,22 @@ class App(tk.Tk):
                            cancel="Cancel")
 
     def _btn(self, parent, text, cmd, primary=False, tip=None, **kw):
-        base = RUFOUS if primary else DUSK3
-        hov = RUFOUS_HI if primary else HOVER
-        b = tk.Button(parent, text=text, command=cmd, bg=base,
-                      fg=DUSK if primary else BUFF,
-                      activebackground=hov,
-                      activeforeground=DUSK if primary else BUFF,
-                      relief="flat", font=SANS_B, padx=15, pady=7,
-                      cursor="hand2", bd=0, **kw)
-        b.bind("<Enter>", lambda _e: b.configure(
-            bg=hov if b["state"] != "disabled" else base), add="+")
-        b.bind("<Leave>", lambda _e: b.configure(bg=base), add="+")
-        if tip:
-            Tooltip(b, tip)
-        return b
+        return ui.button(parent, text, cmd,
+                         kind="primary" if primary else "normal",
+                         tip=tip, **kw)
 
-    def _linkbtn(self, parent, text, cmd, tip=None):
-        b = tk.Button(parent, text=text, command=cmd, bg=DUSK, fg=SLATE,
-                      activebackground=DUSK, activeforeground=BUFF,
-                      relief="flat", font=SANS_9B, padx=6, pady=2,
-                      cursor="hand2", bd=0)
-        b.bind("<Enter>", lambda _e: b.configure(fg=BUFF), add="+")
-        b.bind("<Leave>", lambda _e: b.configure(fg=SLATE), add="+")
-        if tip:
-            Tooltip(b, tip)
-        return b
+    def _linkbtn(self, parent, text, cmd, tip=None, bg=None):
+        return ui.link(parent, text, cmd, bg=bg or DUSK, tip=tip)
 
     def _zebra(self, tv):
-        for i, iid in enumerate(tv.get_children()):
-            tags = [t for t in tv.item(iid, "tags")
-                    if t not in ("even", "odd")]
-            tags.append("even" if i % 2 == 0 else "odd")
-            tv.item(iid, tags=tags)
-
-    def _style_table(self, tv):
-        """Zebra colors, hint style and click-to-sort headings."""
-        tv.tag_configure("even", background=SPOT)
-        tv.tag_configure("odd", background=ZEBRA)
-        tv.tag_configure("hint", foreground=FAINT)
-
-        def sortkey(v):
-            s = (str(v).replace(",", "").replace("+", "")
-                 .replace(" KSL", "").replace("…", "").strip())
-            try:
-                return (0, float(s), "")
-            except ValueError:
-                return (1, 0.0, s.lower())
-
-        def sort(col, rev):
-            rows = [(tv.set(i, col), i) for i in tv.get_children()]
-            rows.sort(key=lambda t: sortkey(t[0]), reverse=rev)
-            for pos, (_v, i) in enumerate(rows):
-                tv.move(i, "", pos)
-            tv.heading(col, command=lambda c=col: sort(c, not rev))
-            self._zebra(tv)
-
-        for c in tv["columns"]:
-            tv.heading(c, command=lambda c=c: sort(c, False))
+        ui.zebra(tv)
 
     def _hint_if_empty(self, tv, text):
-        if not tv.get_children():
-            vals = [""] * len(tv["columns"])
-            vals[0] = text
-            tv.insert("", "end", values=vals, tags=("hint",))
+        ui.hint_if_empty(tv, text)
 
-    def _tree(self, parent, spec, height=8, stretch=None):
-        """Treeview + auto-hiding styled scrollbar. spec: (name,width,anchor)."""
-        wrap = tk.Frame(parent, bg=DUSK)
-        cols = [n for n, _w, _a in spec]
-        tv = ttk.Treeview(wrap, columns=cols, show="headings",
-                          style="KV.Treeview", height=height,
-                          selectmode="browse")
-        for name, wdt, anc in spec:
-            tv.heading(name, text=name.upper())
-            tv.column(name, width=wdt, anchor=anc, stretch=(name == stretch))
-        sb = ttk.Scrollbar(wrap, orient="vertical", command=tv.yview,
-                           style="KV.Vertical.TScrollbar")
-        sb.pack(side="right", fill="y")
-        tv.pack(side="left", fill="both", expand=True)
-
-        def set_sb(lo, hi):
-            sb.set(lo, hi)
-            try:
-                if float(lo) <= 0.0 and float(hi) >= 1.0:
-                    sb.pack_forget()
-                elif not sb.winfo_ismapped():
-                    sb.pack(side="right", fill="y", before=tv)
-            except Exception:
-                pass
-
-        tv.configure(yscrollcommand=set_sb)
-        tv.tag_configure("pos", foreground=GREEN)
-        tv.tag_configure("neg", foreground=RED)
-        tv.tag_configure("pend", foreground=AMBER)
-        tv.tag_configure("dim", foreground=FAINT)
-        self._style_table(tv)
-        return wrap, tv
+    def _tree(self, parent, spec, height=8, stretch=None, bg=None):
+        return ui.tree(parent, spec, height=height, stretch=stretch,
+                       bg=bg or DUSK)
 
     # ----------------------------------------------------------------- menu
     def _build_menu(self):
@@ -1104,6 +1112,16 @@ class App(tk.Tk):
                            command=self._save_announcements_pref)
         sm.add_command(label="Forget dismissed announcements",
                        command=self._reset_announcements)
+        sm.add_separator()
+        # Turning update checks off was a one-way door: the toast that
+        # confirmed it said "Settings turns them back on", and Settings
+        # had no such item. It does now.
+        self.updates_on = tk.BooleanVar(
+            value=bool(self.settings.get("check_updates", True)))
+        sm.add_checkbutton(label="Check for new versions",
+                           variable=self.updates_on,
+                           onvalue=True, offvalue=False,
+                           command=self._toggle_update_checks)
         bar.add_cascade(label="Settings", menu=sm)
         hm = tk.Menu(bar, tearoff=0, **mk)
         hm.add_command(label="About Kestrel Wallet", command=self._about)
@@ -1149,13 +1167,18 @@ class App(tk.Tk):
                               f"http://12.34.56.78:{params.DEFAULT_PORT}.",
                               "warn")
         self.toast(f"Connecting to {url}…")
-        threading.Thread(target=self._add_peer_worker, args=(url,),
-                         daemon=True).start()
+        # node_url() reads a Tk variable, and only the main thread may do
+        # that — so read it here and hand the worker a plain string. The
+        # rest of this file already does it that way; these two were the
+        # holdouts, and on a non-threaded Tcl build they surface a Tk
+        # error dressed up as a connection failure.
+        threading.Thread(target=self._add_peer_worker,
+                         args=(url, self.node_url()), daemon=True).start()
 
-    def _add_peer_worker(self, url):
+    def _add_peer_worker(self, url, node_url):
         reason = diagnose_node(url)      # quick reachability probe first
         try:
-            http_json("POST", self.node_url() + "/peers/add",
+            http_json("POST", node_url + "/peers/add",
                       {"url": url}, timeout=8)
         except Exception as e:
             return self.q.put(("toast", f"Could not save that node: {e}",
@@ -1170,16 +1193,17 @@ class App(tk.Tk):
         self.q.put(("refresh",))
 
     def _share_node(self):
-        threading.Thread(target=self._share_worker, daemon=True).start()
+        threading.Thread(target=self._share_worker,
+                         args=(self.node_url(),), daemon=True).start()
 
-    def _share_worker(self):
+    def _share_worker(self, node_url):
         try:
-            s = http_json("GET", self.node_url() + "/supply", timeout=6)
+            s = http_json("GET", node_url + "/supply", timeout=6)
             pub = s.get("public_url")
             if pub:
                 url, public = pub, True
             else:
-                port = self.node_url().rsplit(":", 1)[-1]
+                port = node_url.rsplit(":", 1)[-1]
                 url, public = f"http://{get_lan_ip()}:{port}", False
             self.q.put(("sharedlg", url, public))
         except Exception as e:
@@ -1244,9 +1268,18 @@ class App(tk.Tk):
         if not self.settings.get("announcements", True):
             return
         seen = self.settings.get("announcements_seen", [])
-        announcements.check(self._on_announcements, seen)
-        self._note_job = self.after(ANNOUNCE_EVERY_MS,
-                                    self._check_announcements)
+        # Re-arm FIRST. Booking the next check only after a successful
+        # fetch meant anything that threw in between — a thread that
+        # wouldn't start, a Tcl hiccup — ended announcements for the rest
+        # of the session, silently. This is the one repeating job in the
+        # app that predates the resilient loops in ui.py.
+        try:
+            self._note_job = self.after(ANNOUNCE_EVERY_MS,
+                                        self._check_announcements)
+        except Exception:
+            self._note_job = None
+        self.safe(announcements.check, self._on_announcements, seen,
+                  where="announcements")
 
     def _on_announcements(self, items):
         """Called from a background thread, only when something is new."""
@@ -1376,15 +1409,16 @@ class App(tk.Tk):
         body.rowconfigure(0, weight=1)
 
         # ------------------------------------------------------ sidebar
-        rail = tk.Frame(body, bg=RAIL, width=182)
+        rail = tk.Frame(body, bg=RAIL, width=212)
         rail.grid(row=0, column=0, sticky="nsw")
         rail.pack_propagate(False)
+        tk.Frame(body, bg=LINE_SOFT, width=1).grid(row=0, column=0,
+                                                   sticky="nse")
+
         brand = tk.Frame(rail, bg=RAIL)
-        brand.pack(fill="x", padx=18, pady=(18, 22))
-        tk.Label(brand, text="▲ kestrel", bg=RAIL, fg=BUFF,
-                 font=BRAND).pack(anchor="w")
-        tk.Label(brand, text="WALLET", bg=RAIL, fg=RUFOUS_HI,
-                 font=TINY_B).pack(anchor="w")
+        brand.pack(fill="x", padx=ui.PAD_L, pady=(ui.PAD_L, ui.PAD_XL - 4))
+        ui.brand(brand, "kestrel", sub="wallet", bg=RAIL, size=32
+                 ).pack(anchor="w")
 
         self._navbtn = {}
         for name in self.VIEWS:
@@ -1393,49 +1427,57 @@ class App(tk.Tk):
             ind = tk.Frame(rowf, bg=RAIL, width=3)
             ind.pack(side="left", fill="y")
             b = tk.Button(rowf, anchor="w", relief="flat",
-                          text=f"  {self.ICONS.get(name, '')}  {name}",
+                          text=f"   {self.ICONS.get(name, '')}   {name}",
                           bd=0, bg=RAIL, fg=MUTED, activebackground=DUSK2,
-                          activeforeground=BUFF, font=SANS_B, padx=14, pady=10,
-                          cursor="hand2",
+                          activeforeground=BUFF, font=SANS_B,
+                          padx=12, pady=11, cursor="hand2",
+                          highlightthickness=0,
                           command=lambda n=name: self.show_view(n))
             b.pack(side="left", fill="x", expand=True)
 
             def hov(_e, nm=name, on=True):
                 bb, _i, _r = self._navbtn[nm]
                 if nm != getattr(self, "_active_view", None):
-                    bb.configure(bg="#1A2130" if on else RAIL)
+                    bb.configure(bg=ui.mix(RAIL, BUFF, 0.06) if on else RAIL)
             b.bind("<Enter>", lambda e, nm=name: hov(e, nm, True))
             b.bind("<Leave>", lambda e, nm=name: hov(e, nm, False))
             self._navbtn[name] = (b, ind, rowf)
 
         foot = tk.Frame(rail, bg=RAIL)
-        foot.pack(side="bottom", fill="x", padx=18, pady=16)
-        row = tk.Frame(foot, bg=RAIL); row.pack(anchor="w")
-        self.dot_l = tk.Label(row, text="●", bg=RAIL, fg=FAINT,
-                              font=SANS)
+        foot.pack(side="bottom", fill="x", padx=ui.PAD_L, pady=ui.PAD_M + 2)
+
+        # a newer version, once we know of one — packed only then
+        self.update_chip = tk.Button(
+            foot, text="", bg=ui.RUFOUS_LO, fg=BUFF, activebackground=RUFOUS,
+            activeforeground=BUFF, relief="flat", bd=0, font=TINY_B,
+            cursor="hand2", pady=6, anchor="w", highlightthickness=0)
+        ui.hover(self.update_chip, ui.RUFOUS_LO, RUFOUS)
+
+        row = tk.Frame(foot, bg=RAIL); row.pack(anchor="w", fill="x")
+        self.dot_l = tk.Label(row, text="●", bg=RAIL, fg=FAINT, font=SANS_9)
         self.dot_l.pack(side="left")
         self.conn_var = tk.StringVar(value="Connecting…")
         tk.Label(row, textvariable=self.conn_var, bg=RAIL, fg=MUTED,
-                 font=SANS_9).pack(side="left", padx=(5, 0))
+                 font=SANS_9, anchor="w").pack(side="left", padx=(5, 0))
         rbtn = tk.Button(row, text=" ⟳", command=self._refresh_now, bg=RAIL,
-                         fg=MUTED, activebackground=RAIL,
+                         fg=FAINT, activebackground=RAIL,
                          activeforeground=BUFF, relief="flat", bd=0,
-                         font=SANS_B, cursor="hand2")
-        rbtn.pack(side="left", padx=(6, 0))
-        rbtn.bind("<Enter>", lambda _e: rbtn.configure(fg=BUFF))
-        rbtn.bind("<Leave>", lambda _e: rbtn.configure(fg=MUTED))
+                         font=SANS_B, cursor="hand2", highlightthickness=0)
+        rbtn.pack(side="right")
+        ui.hover(rbtn, FAINT, BUFF, attr="fg")
         Tooltip(rbtn, "Refresh balance and transactions now (F5)")
+
+        tk.Frame(foot, bg=LINE_SOFT, height=1).pack(fill="x",
+                                                    pady=(ui.PAD_M, ui.PAD_S))
         self.node_lbl_var = tk.StringVar(value="")
-        tk.Label(foot, textvariable=self.node_lbl_var, bg=RAIL, fg=FAINT,
-                 font=MONO_8).pack(anchor="w", pady=(3, 0))
         self.block_var = tk.StringVar(value="")
-        tk.Label(foot, textvariable=self.block_var, bg=RAIL, fg=FAINT,
-                 font=MONO_8).pack(anchor="w", pady=(3, 0))
         self.updated_var = tk.StringVar(value="")
-        tk.Label(foot, textvariable=self.updated_var, bg=RAIL, fg=FAINT,
-                 font=MONO_8).pack(anchor="w", pady=(3, 0))
-        tk.Label(foot, text=f"v{KVER} · MIT", bg=RAIL, fg=FAINT,
-                 font=MONO_8).pack(anchor="w", pady=(3, 0))
+        for var in (self.node_lbl_var, self.block_var, self.updated_var):
+            tk.Label(foot, textvariable=var, bg=RAIL, fg=FAINT, font=MONO_8,
+                     anchor="w", justify="left", wraplength=168
+                     ).pack(fill="x", pady=(2, 0))
+        tk.Label(foot, text=f"v{KVER} · MIT", bg=RAIL, fg=ui.mix(RAIL, BUFF,
+                 0.22), font=MONO_8, anchor="w").pack(fill="x", pady=(6, 0))
 
         # ------------------------------------------------------ content
         content = tk.Frame(body, bg=DUSK)
@@ -1498,41 +1540,38 @@ class App(tk.Tk):
 
     def _page(self, f, title, subtitle=""):
         p = tk.Frame(f, bg=DUSK)
-        p.pack(fill="both", expand=True, padx=28, pady=22)
-        tk.Label(p, text=title, bg=DUSK, fg=BUFF,
+        p.pack(fill="both", expand=True, padx=ui.PAD_XL, pady=ui.PAD_L + 2)
+        head = tk.Frame(p, bg=DUSK); head.pack(fill="x")
+        tk.Label(head, text=title, bg=DUSK, fg=BUFF,
                  font=TITLE).pack(anchor="w")
         if subtitle:
-            tk.Label(p, text=subtitle, bg=DUSK, fg=FAINT, font=SANS_9
-                     ).pack(anchor="w", pady=(1, 0))
-        tk.Frame(p, bg=DUSK3, height=1).pack(fill="x", pady=(12, 16))
+            tk.Label(head, text=subtitle, bg=DUSK, fg=FAINT,
+                     font=SANS_9).pack(anchor="w", pady=(2, 0))
+        tk.Frame(p, bg=LINE_SOFT, height=1).pack(fill="x", pady=(14, 18))
         return p
 
-    def _card(self, parent):
-        c = tk.Frame(parent, bg=DUSK2, highlightbackground=DUSK3,
-                     highlightthickness=1)
-        inner = tk.Frame(c, bg=DUSK2)
-        inner.pack(fill="both", expand=True, padx=18, pady=14)
-        return c, inner
+    def _card(self, parent, bg=None):
+        return ui.card(parent, bg=bg or DUSK2)
 
     # ------------------------------------------------------------- overview
     def _view_overview(self, f):
-        p = self._page(f, "Overview", "Your balances and latest activity")
+        p = self._page(f, "Overview", "Your balance and latest activity")
 
         # back-up-your-key banner (hidden once backed up / dismissed)
-        self.banner = tk.Frame(p, bg="#2E2718", highlightbackground=AMBER,
-                               highlightthickness=1)
-        brow = tk.Frame(self.banner, bg="#2E2718")
-        brow.pack(fill="x", padx=12, pady=8)
-        tk.Label(brow, text="⚠  Back up your key — it is the only way to "
-                 "restore your coins if this computer dies.",
-                 bg="#2E2718", fg=AMBER, font=SANS_9,
-                 wraplength=520, justify="left").pack(side="left")
-        self._linkbtn(brow, "I've already done this",
-                      self._dismiss_banner).pack(side="right")
-        bb = self._btn(brow, "Back up now", self._backup_wallet)
-        bb.configure(padx=10, pady=3, font=SANS_9B)
-        bb.pack(side="right", padx=(0, 8))
+        self.banner, bin_ = ui.spined_card(p, "warn", pad=ui.PAD_S)
+        brow = tk.Frame(bin_, bg=ui.AMBER_LO); brow.pack(fill="x")
+        tk.Label(brow, text="Back up your key", bg=ui.AMBER_LO, fg=AMBER,
+                 font=SANS_9B).pack(anchor="w")
+        tk.Label(brow, text="It is the only way to restore your coins if "
+                 "this computer dies.", bg=ui.AMBER_LO, fg=MUTED,
+                 font=SANS_9, wraplength=520, justify="left").pack(anchor="w")
+        bact = tk.Frame(bin_, bg=ui.AMBER_LO); bact.pack(side="right")
+        self._linkbtn(bact, "Already done", self._dismiss_banner,
+                      bg=ui.AMBER_LO).pack(side="right", padx=(10, 0))
+        ui.button(bact, "Back up now", self._backup_wallet,
+                  kind="primary").pack(side="right")
 
+        # --- the balance, and what is still in flight
         card, c = self._card(p)
         card.pack(fill="x")
         self._ov_card = card
@@ -1540,44 +1579,59 @@ class App(tk.Tk):
         self.immature_var = tk.StringVar(value="0.00000000 KSL")
         self.total_var = tk.StringVar(value="0.00000000 KSL")
         self.pending_var = tk.StringVar(value="—")
-        tk.Label(c, text="AVAILABLE", bg=DUSK2, fg=RUFOUS_HI,
-                 font=TINY_B).pack(anchor="w")
-        tk.Label(c, textvariable=self.avail_var, bg=DUSK2, fg=BUFF,
-                 font=MONO_26B).pack(anchor="w")
-        row = tk.Frame(c, bg=DUSK2); row.pack(anchor="w", pady=(8, 0))
-        for label, var, color in (
-                ("Immature (maturing rewards)", self.immature_var, MUTED),
-                ("Total", self.total_var, MUTED),
-                ("Unconfirmed", self.pending_var, AMBER)):
-            box = tk.Frame(row, bg=DUSK2); box.pack(side="left", padx=(0, 34))
-            tk.Label(box, text=label, bg=DUSK2, fg=FAINT,
-                     font=TINY).pack(anchor="w")
-            tk.Label(box, textvariable=var, bg=DUSK2, fg=color,
-                     font=MONO_12).pack(anchor="w")
+
+        tk.Label(c, text="AVAILABLE TO SPEND", bg=DUSK2, fg=RUFOUS_HI,
+                 font=MICRO_B).pack(anchor="w")
+        big = tk.Label(c, textvariable=self.avail_var, bg=DUSK2, fg=BUFF,
+                       font=MONO_26B)
+        big.pack(anchor="w", pady=(4, 0))
+        self.avail_od = ui.Odometer(
+            self, self.avail_var, fmt=lambda v: f"{v:,.8f} KSL")
+
+        row = tk.Frame(c, bg=DUSK2); row.pack(anchor="w", fill="x",
+                                              pady=(ui.PAD_M, 0))
+        for lbl, var, col, tip in (
+                ("Total", self.total_var, MUTED,
+                 "Everything confirmed on the chain, spendable or not"),
+                ("Maturing", self.immature_var, MUTED,
+                 f"Mined coins become spendable after "
+                 f"{params.COINBASE_MATURITY} blocks"),
+                ("In flight", self.pending_var, AMBER,
+                 "Sent or received but not yet in a block")):
+            box = tk.Frame(row, bg=DUSK2); box.pack(side="left",
+                                                    padx=(0, ui.PAD_XL))
+            tk.Label(box, text=lbl.upper(), bg=DUSK2, fg=FAINT,
+                     font=MICRO_B).pack(anchor="w")
+            v = tk.Label(box, textvariable=var, bg=DUSK2, fg=col, font=MONO_12)
+            v.pack(anchor="w")
+            Tooltip(box, tip); Tooltip(v, tip)
+
+        # the honest line about anything unconfirmed — packed on demand
         self.pend_note = tk.Label(c, text="", bg=DUSK2, fg=AMBER,
-                                  font=SANS_9, justify="left")
+                                  font=SANS_9, justify="left", anchor="w",
+                                  wraplength=640)
 
-        qa = tk.Frame(p, bg=DUSK); qa.pack(fill="x", pady=(14, 0))
-        self._btn(qa, "↑  Send KSL", lambda: self.show_view("Send"),
-                  primary=True).pack(side="left")
-        self._btn(qa, "↓  Receive", lambda: self.show_view("Receive")
-                  ).pack(side="left", padx=(8, 0))
-        self._btn(qa, "Copy my address", self.copy_address,
+        qa = tk.Frame(p, bg=DUSK); qa.pack(fill="x", pady=(ui.PAD_L, 0))
+        ui.button(qa, "↑  Send KSL", lambda: self.show_view("Send"),
+                  kind="primary").pack(side="left")
+        ui.button(qa, "↓  Receive", lambda: self.show_view("Receive")
+                  ).pack(side="left", padx=(ui.PAD_S, 0))
+        ui.button(qa, "Copy my address", self.copy_address,
                   tip="Copy your address — share it to get paid"
-                  ).pack(side="left", padx=(8, 0))
+                  ).pack(side="left", padx=(ui.PAD_S, 0))
 
-        rhead = tk.Frame(p, bg=DUSK); rhead.pack(fill="x", pady=(18, 6))
-        tk.Label(rhead, text="RECENT ACTIVITY", bg=DUSK, fg=RUFOUS_HI,
-                 font=TINY_B).pack(side="left")
-        self._linkbtn(rhead, "See all →",
-                      lambda: self.show_view("Transactions")
-                      ).pack(side="left", padx=(10, 0))
-        self._btn(rhead, "⟳ Refresh", self._refresh_now,
-                  tip="Fetch the newest balance and activity"
-                  ).pack(side="right")
+        ui.section(p, "recent activity", bg=DUSK, right=lambda r: (
+            self._linkbtn(r, "See all →",
+                          lambda: self.show_view("Transactions")
+                          ).pack(side="left", padx=(ui.PAD_M, 0)),
+            ui.button(r, "⟳", self._refresh_now, kind="quiet", bg_of=DUSK,
+                      tip="Fetch the newest balance and activity"
+                      ).pack(side="right"))
+        ).pack(fill="x", pady=(ui.PAD_L + 4, ui.PAD_S))
+
         wrap, self.recent_tv = self._tree(
-            p, (("date", 160, "w"), ("type", 100, "w"), ("amount", 140, "e"),
-                ("status", 110, "w")),
+            p, (("when", 170, "w"), ("type", 110, "w"), ("amount", 160, "e"),
+                ("status", 180, "w")),
             height=7, stretch="amount")
         wrap.pack(fill="both", expand=True)
         self.recent_tv.bind("<Double-1>",
@@ -1600,74 +1654,97 @@ class App(tk.Tk):
     # ----------------------------------------------------------------- send
     def _view_send(self, f):
         p = self._page(f, "Send",
-                       "Signed on this machine, confirmed in ~2 minutes")
+                       "Signed on this machine, confirmed in about two "
+                       "minutes")
         card, c = self._card(p)
         card.pack(fill="x")
-        row0 = tk.Frame(c, bg=DUSK2); row0.pack(fill="x", pady=(0, 10))
-        tk.Label(row0, text="AVAILABLE", bg=DUSK2, fg=FAINT,
-                 font=TINY_B).pack(side="left")
-        tk.Label(row0, textvariable=self.avail_var, bg=DUSK2, fg=SLATE,
-                 font=MONO_11B).pack(side="left", padx=(8, 0))
 
-        tk.Label(c, text="PAY TO", bg=DUSK2,
-                 fg=RUFOUS_HI, font=TINY_B).pack(anchor="w")
-        row = tk.Frame(c, bg=DUSK2); row.pack(fill="x", pady=(4, 2))
+        def field(title, hint=""):
+            head = tk.Frame(c, bg=DUSK2); head.pack(fill="x")
+            tk.Label(head, text=title.upper(), bg=DUSK2, fg=RUFOUS_HI,
+                     font=MICRO_B).pack(side="left")
+            if hint:
+                tk.Label(head, text=hint, bg=DUSK2, fg=FAINT,
+                         font=TINY).pack(side="left", padx=(8, 0))
+            return head
+
+        row0 = tk.Frame(c, bg=DUSK2); row0.pack(fill="x",
+                                                pady=(0, ui.PAD_L))
+        tk.Label(row0, text="AVAILABLE TO SPEND", bg=DUSK2, fg=FAINT,
+                 font=MICRO_B).pack(side="left")
+        tk.Label(row0, textvariable=self.avail_var, bg=DUSK2, fg=BUFF,
+                 font=MONO_13).pack(side="left", padx=(10, 0))
+
+        field("pay to")
+        row = tk.Frame(c, bg=DUSK2); row.pack(fill="x", pady=(6, 3))
         self.to_e = self._entry(row)
-        self.to_e.pack(side="left", fill="x", expand=True, ipady=5)
+        self.to_e.pack(side="left", fill="x", expand=True, ipady=7)
         self.to_e.bind("<KeyRelease>", lambda _e: self._validate_send())
-        self._btn(row, "Paste", self._paste_to,
+        ui.button(row, "Paste", self._paste_to,
                   tip="Paste an address from the clipboard"
-                  ).pack(side="left", padx=(6, 0))
-        self._btn(row, "Contacts", lambda: self.show_view("Contacts")
-                  ).pack(side="left", padx=(6, 0))
+                  ).pack(side="left", padx=(ui.PAD_S, 0))
+        ui.button(row, "Contacts", lambda: self.show_view("Contacts")
+                  ).pack(side="left", padx=(ui.PAD_S, 0))
         self.to_hint = tk.Label(c, text="", bg=DUSK2, fg=FAINT, font=TINY,
                                 anchor="w")
-        self.to_hint.pack(fill="x", pady=(0, 8))
+        self.to_hint.pack(fill="x", pady=(0, ui.PAD_L))
 
-        tk.Label(c, text="LABEL  —  optional, saved to Contacts", bg=DUSK2,
-                 fg=RUFOUS_HI, font=TINY_B).pack(anchor="w")
-        self.label_e = self._entry(c)
-        self.label_e.pack(fill="x", ipady=4, pady=(4, 12))
+        field("label", "optional — saved to Contacts")
+        self.label_e = self._entry(c, f="body")
+        self.label_e.pack(fill="x", ipady=6, pady=(6, ui.PAD_L))
 
-        tk.Label(c, text="AMOUNT", bg=DUSK2, fg=RUFOUS_HI,
-                 font=TINY_B).pack(anchor="w")
-        row2 = tk.Frame(c, bg=DUSK2); row2.pack(fill="x", pady=(4, 2))
-        self.amt_e = self._entry(row2, width=16)
-        self.amt_e.pack(side="left", ipady=5)
+        field("amount")
+        row2 = tk.Frame(c, bg=DUSK2); row2.pack(fill="x", pady=(6, 0))
+        self.amt_e = self._entry(row2, width=15, f="mono_lead")
+        self.amt_e.pack(side="left", ipady=7)
         self.amt_e.bind("<KeyRelease>", lambda _e: self._validate_send())
-        self.max_btn = self._btn(row2, "Max", self.fill_max,
+        tk.Label(row2, text="KSL", bg=DUSK2, fg=MUTED,
+                 font=SANS).pack(side="left", padx=(8, ui.PAD_S))
+        self.max_btn = ui.button(row2, "Max", self.fill_max,
                                  tip="Send everything available,\n"
                                      "minus the network fee")
-        self.max_btn.pack(side="left", padx=(6, 0))
-        tk.Label(row2, text="KSL", bg=DUSK2, fg=MUTED,
-                 font=SANS).pack(side="left", padx=(8, 18))
-        tk.Label(row2, text="fee", bg=DUSK2, fg=MUTED,
-                 font=SANS).pack(side="left", padx=(0, 6))
-        self.fee_e = self._entry(row2, width=10)
+        self.max_btn.pack(side="left")
+
+        feebox = tk.Frame(c, bg=DUSK2); feebox.pack(fill="x",
+                                                    pady=(ui.PAD_L, 0))
+        tk.Label(feebox, text="NETWORK FEE", bg=DUSK2, fg=RUFOUS_HI,
+                 font=MICRO_B).pack(side="left")
+        tk.Label(feebox, text="paid to whoever mines the block",
+                 bg=DUSK2, fg=FAINT, font=TINY).pack(side="left",
+                                                     padx=(8, 0))
+        row3 = tk.Frame(c, bg=DUSK2); row3.pack(fill="x", pady=(6, 0))
+        self.fee_e = self._entry(row3, width=12)
         self.fee_e.insert(0, "0.00001")
-        self.fee_e.pack(side="left", ipady=5)
+        self.fee_e.pack(side="left", ipady=6)
         self.fee_e.bind("<KeyRelease>", lambda _e: self._validate_send())
-        Tooltip(self.fee_e, "The network fee paid to the miner who\n"
-                            "confirms this payment (minimum 0.00001 KSL)")
-        for label, mult in (("min", 1), ("×10", 10), ("×100", 100)):
-            self._linkbtn(row2, label,
-                          lambda m=mult: self._set_fee(m),
-                          tip="Bigger fees can help when many payments\n"
-                              "compete for the next block"
-                          ).pack(side="left", padx=(4, 0))
+        Tooltip(self.fee_e, "The fee paid to the miner who confirms this\n"
+                            "payment (minimum 0.00001 KSL)")
+        seg = tk.Frame(row3, bg=LINE, padx=1, pady=1)
+        seg.pack(side="left", padx=(ui.PAD_S, 0))
+        for lbl, mult in (("minimum", 1), ("×10", 10), ("×100", 100)):
+            tk.Button(seg, text=lbl, bd=0, relief="flat", bg=SPOT, fg=MUTED,
+                      activebackground=DUSK3, activeforeground=BUFF,
+                      font=SANS_9B, padx=11, pady=4, cursor="hand2",
+                      highlightthickness=0,
+                      command=lambda m=mult: self._set_fee(m)).pack(
+                          side="left")
+        Tooltip(seg, "A bigger fee can help when many payments are\n"
+                     "competing for the next block")
 
         self.after_var = tk.StringVar(value="")
         self.after_lbl = tk.Label(c, textvariable=self.after_var, bg=DUSK2,
-                                  fg=FAINT, font=TINY, anchor="w")
-        self.after_lbl.pack(fill="x", pady=(2, 8))
+                                  fg=FAINT, font=SANS_9, anchor="w",
+                                  wraplength=560, justify="left")
+        self.after_lbl.pack(fill="x", pady=(ui.PAD_M, ui.PAD_M))
 
-        self.send_btn = self._btn(c, "Send", self.send, primary=True)
-        self.send_btn.pack(anchor="w", pady=(2, 4))
+        self.send_btn = ui.button(c, "Send payment", self.send,
+                                  kind="primary")
+        self.send_btn.pack(anchor="w")
         for e in (self.to_e, self.amt_e, self.fee_e):
             e.bind("<Return>", lambda _ev: self.send())
         self.send_note = tk.Label(p, text="", bg=DUSK, fg=MUTED, font=SANS,
                                   anchor="w", wraplength=680, justify="left")
-        self.send_note.pack(fill="x", pady=(12, 0))
+        self.send_note.pack(fill="x", pady=(ui.PAD_M, 0))
         self._validate_send()
 
     def _set_fee(self, mult):
@@ -1792,11 +1869,13 @@ class App(tk.Tk):
                  "nobody can take anything with it.",
                  bg=DUSK2, fg=MUTED, font=SANS_9, wraplength=380,
                  justify="left").pack(anchor="w", pady=(12, 0))
-        tk.Label(p, text="Incoming payments count toward your balance after "
-                 "one confirmation (~2 minutes) and show up under "
-                 "Unconfirmed the moment they are sent. Mining rewards "
-                 "mature after 10 blocks. Back up your key once — File ▸ "
-                 "Backup — and this address is yours forever.",
+        tk.Label(p, text="A payment shows under In flight on the Overview "
+                 "the moment it is sent, and counts toward your balance "
+                 f"once a block confirms it — about two minutes. Mining "
+                 f"rewards become spendable after "
+                 f"{params.COINBASE_MATURITY} blocks. Back up your key "
+                 "once — File ▸ Backup — and this address is yours "
+                 "forever.",
                  bg=DUSK, fg=MUTED, font=SANS, wraplength=680,
                  justify="left").pack(anchor="w", pady=(14, 0))
 
@@ -1864,26 +1943,29 @@ class App(tk.Tk):
     def _view_transactions(self, f):
         p = self._page(f, "Transactions",
                        "Everything this wallet has sent, received and mined")
-        bar = tk.Frame(p, bg=DUSK); bar.pack(fill="x", pady=(0, 8))
+        bar = tk.Frame(p, bg=DUSK); bar.pack(fill="x", pady=(0, ui.PAD_M))
+        # a segmented control rather than five loose buttons: the filters
+        # are one choice, and should look like one
+        seg = tk.Frame(bar, bg=LINE, padx=1, pady=1); seg.pack(side="left")
         self._tx_filter_btns = {}
         for name in ("All", "Sent", "Received", "Mined", "Pending"):
-            b = tk.Button(bar, text=name, bd=0, relief="flat", bg=DUSK,
-                          fg=MUTED, activebackground=DUSK,
-                          activeforeground=BUFF, font=SANS_9B, padx=9,
-                          pady=2, cursor="hand2",
+            b = tk.Button(seg, text=name, bd=0, relief="flat", bg=SPOT,
+                          fg=MUTED, activebackground=DUSK3,
+                          activeforeground=BUFF, font=SANS_9B, padx=13,
+                          pady=5, cursor="hand2", highlightthickness=0,
                           command=lambda n=name: self._set_tx_filter(n))
             b.pack(side="left")
             self._tx_filter_btns[name] = b
-        self.tx_search = self._entry(bar, width=26)
+        self.tx_search = self._entry(bar, width=28, f="small")
         self._placeholder(self.tx_search, "search txid / amount / date…")
-        self.tx_search.pack(side="right", ipady=3)
+        self.tx_search.pack(side="right", ipady=5)
         self.tx_search.bind("<KeyRelease>",
                             lambda _e: self._paint_tx_tables())
 
         wrap, self.tx_tv = self._tree(
-            p, (("date", 150, "w"), ("type", 85, "w"),
-                ("transaction id", 200, "w"), ("amount", 140, "e"),
-                ("status", 110, "w")),
+            p, (("date", 150, "w"), ("type", 90, "w"),
+                ("transaction id", 190, "w"), ("amount", 150, "e"),
+                ("status", 155, "w")),
             height=15, stretch="transaction id")
         wrap.pack(fill="both", expand=True)
         self.tx_tv.bind("<Double-1>", lambda _e: self._tx_details())
@@ -1909,7 +1991,7 @@ class App(tk.Tk):
         self._tx_filter = name
         for nm, b in self._tx_filter_btns.items():
             b.configure(fg=BUFF if nm == name else MUTED,
-                        bg=DUSK3 if nm == name else DUSK)
+                        bg=DUSK3 if nm == name else SPOT)
         self._paint_tx_tables()
 
     def _selected_row(self):
@@ -2102,89 +2184,120 @@ class App(tk.Tk):
     def node_url(self):
         return self.node_var.get().strip().rstrip("/")
 
-    def _drain_queue(self):
-        try:
-            while True:
-                kind, *rest = self.q.get_nowait()
-                if kind == "setnode":
-                    url, how = rest
-                    self.node_var.set(url)
-                    self.toast(f"Connected — {how}.", "good")
-                    self.refresh()
-                elif kind == "status":
-                    online, tip, mined, peers, target = rest
-                    self.online = online
-                    self.tip_height = tip
-                    self.dot_l.configure(fg=GREEN if online else RED)
-                    self.conn_var.set(
-                        (f"Connected · {peers} node(s)" if peers
-                         else "Connected") if online else "Offline")
-                    host = self.node_url().replace("http://", "")
-                    self.node_lbl_var.set(
-                        f"node {host}" + (" (built-in)" if self.embedded
-                                          else ""))
-                    if online and target > tip:
-                        self.block_var.set(
-                            f"⬇ downloading ledger {tip:,} / {target:,}")
-                    else:
-                        self.block_var.set(
-                            f"block {tip:,} · {mined} mined" if online else
-                            "searching for a node…")
-                    if self._was_online is not None and \
-                            online != self._was_online:
-                        self.toast("Connection restored." if online else
-                                   "Lost the node — reconnecting…",
-                                   "good" if online else "warn")
-                    self._was_online = online
-                elif kind == "balance":
-                    self._apply_balance(*rest)
-                elif kind == "note":
-                    text, color = rest
-                    self.send_note.configure(text=text, fg=color)
-                elif kind == "toast":
-                    self.toast(*rest)
-                elif kind == "connfail":
-                    title, msg = rest
-                    self.toast("Couldn't connect — see the details.", "bad")
-                    self._warn(title, msg)
-                elif kind == "sharedlg":
-                    self._show_share_dialog(*rest)
-                elif kind == "refresh":
-                    self._refresh_now()
-                elif kind == "sent":
-                    self.to_e.delete(0, "end"); self.amt_e.delete(0, "end")
-                    self.label_e.delete(0, "end")
-                    self._validate_send()
-                    self.refresh()
-                    self.after(2000, self.refresh)
-                elif kind == "senddone":
-                    self.send_btn.configure(state="normal", text="Send")
-                    self._validate_send()
-        except queue.Empty:
-            pass
-        self.after(150, self._drain_queue)
+    # ---------------------------------------------------------- the loops
+    #
+    # Three things repeat: draining worker messages, asking the node where
+    # the chain is, and reloading this address. All three go through
+    # ui.Resilient, so a failure in any single tick is reported and the
+    # loop carries on. They used to be plain `after` chains, where one
+    # unhandled exception ended the chain for good and left the window
+    # showing whatever it happened to know at that moment — which is what
+    # made a received payment sit on "Pending" until the app was restarted.
 
-    def _poll(self):
+    def _handle(self, kind, rest):
+        if kind == "setnode":
+            url, how = rest
+            self.node_var.set(url)
+            self.toast(f"Connected — {how}.", "good")
+            self.refresh()
+        elif kind == "status":
+            self._apply_status(*rest)
+        elif kind == "balance":
+            self._apply_balance(*rest)
+        elif kind == "note":
+            text, color = rest
+            self.send_note.configure(text=text, fg=color)
+        elif kind == "toast":
+            self.toast(*rest)
+        elif kind == "connfail":
+            title, msg = rest
+            self.toast("Couldn't connect — see the details.", "bad")
+            self._warn(title, msg)
+        elif kind == "sharedlg":
+            self._show_share_dialog(*rest)
+        elif kind == "refresh":
+            self._refresh_now()
+        elif kind == "stale":
+            self._stale_why = rest[0]
+        elif kind == "update":
+            self._on_update_available(*rest)
+        elif kind == "upstep":
+            self._update_step(*rest)
+        elif kind == "upprog":
+            self._update_progress(*rest)
+        elif kind == "upok":
+            self._update_done()
+        elif kind == "upfail":
+            self._update_failed(*rest)
+        elif kind == "sent":
+            self.to_e.delete(0, "end"); self.amt_e.delete(0, "end")
+            self.label_e.delete(0, "end")
+            self._validate_send()
+            self.refresh()
+            self.after(2500, self.refresh)
+        elif kind == "senddone":
+            self.send_btn.configure(state="normal", text="Send payment")
+            self._validate_send()
+
+    def _apply_status(self, online, tip, mined, peers, target):
+        was_tip = self.tip_height
+        self.online = online
+        self.tip_height = tip
+        self.dot_l.configure(fg=GREEN if online else RED)
+        self.conn_var.set((f"{peers} node{'s' if peers != 1 else ''} online"
+                           if peers else "Connected") if online else "Offline")
+        host = self.node_url().replace("http://", "")
+        self.node_lbl_var.set(f"node {host}"
+                              + (" (built-in)" if self.embedded else ""))
+        if online and target > tip:
+            self.block_var.set(f"⬇ downloading ledger {tip:,} / {target:,}")
+        else:
+            try:
+                whole = f"{float(str(mined).replace(',', '')):,.0f}"
+            except ValueError:
+                whole = mined
+            self.block_var.set(f"block {tip:,}\n{whole} KSL mined" if online
+                               else "searching for a node…")
+        if self._was_online is not None and online != self._was_online:
+            self.toast("Connection restored." if online else
+                       "Lost the node — reconnecting…",
+                       "good" if online else "warn")
+        self._was_online = online
+        # A new block is the only moment a pending payment can become a
+        # confirmed one, so reload the instant we hear about one instead
+        # of waiting out the rest of a fixed interval.
+        if online and tip != was_tip:
+            self.refresh()
+
+    def _start_loops(self):
+        self.drain(self.q, self._handle, ms=120, where="wallet queue")
+        self.every(5000, self._paint_freshness, where="freshness")
+        self.every(6000, self._poll_tick, where="node poll")
+        self.every(12000, self._refresh_tick, where="balance refresh")
+
+    def _poll_tick(self):
         threading.Thread(target=self._poll_worker, args=(self.node_url(),),
                          daemon=True).start()
-        # poll the node less often while minimized (saves CPU and network)
-        self.after(20000 if self.state() == "iconic" else 6000, self._poll)
+        # minimized: ask less often, it saves CPU and network
+        return 20000 if self.state() == "iconic" else 6000
 
     def _poll_worker(self, url):
         try:
             s = http_json("GET", url + "/supply", timeout=5)
             self.q.put(("status", True, s["height"],
                         s["circulating_ksl"].replace(" KSL", ""),
-                        s.get("peers_alive", 0),
-                        s.get("sync_target", 0)))
+                        s.get("peers_alive", 0), s.get("sync_target", 0)))
         except Exception:
             self.q.put(("status", False, 0, "", 0, 0))
 
-    def _auto_refresh(self):
-        if self.state() != "iconic":    # don't churn balance/history while hidden
+    def _refresh_tick(self):
+        minimized = self.state() == "iconic"
+        if not minimized:
             self.refresh()
-        self.after(30000 if self.state() == "iconic" else 12000,
-                   self._auto_refresh)
+        # even while hidden, keep the waiting times honest
+        elif self._pending:
+            self.refresh()
+        return 30000 if minimized else 12000
 
     # -------------------------------------------------------------- wallet
     def new_wallet(self):
@@ -2276,48 +2389,139 @@ class App(tk.Tk):
 
     def _refresh_worker(self, url, address):
         try:
-            a = http_json("GET", f"{url}/address/{address}", timeout=8)
-        except Exception:
+            # One request. Balance, history and what is still in flight all
+            # come from the same instant on the same node, so they cannot
+            # disagree with each other — asking separately used to let a
+            # payment be in both answers, or in neither.
+            a = http_json("GET", f"{url}/address/{address}?n=200", timeout=10)
+        except Exception as e:
+            # This used to return in silence. A refresh that fails every
+            # time then looks identical to a wallet with nothing new — the
+            # screen simply stops changing and never says why.
+            self.q.put(("stale", f"{type(e).__name__}: {e}"))
             return
-        pending = []
-        try:
-            mem = http_json("GET", f"{url}/mempool", timeout=6)
-            for v in mem.get("transactions", []):
-                inn = sum(o.get("amount", 0) for o in v.get("outputs", [])
-                          if o.get("address") == address)
-                out = sum(i.get("amount", 0) for i in v.get("inputs", [])
-                          if i.get("address") == address)
-                if inn or out:
-                    pending.append({
-                        "txid": v.get("txid", ""),
-                        "timestamp": v.get("timestamp", time.time()),
-                        "delta": inn - out,
-                        "outgoing": out > 0,
-                    })
-        except Exception:
-            pass
-        self.q.put(("balance", a, pending))
+        if not a.get("valid", True):
+            self.q.put(("stale", a.get("error") or "the node did not "
+                                                   "recognise this address"))
+            return
+        self.q.put(("balance", a, a.get("pending", [])))
 
     def _apply_balance(self, a, pending):
+        self._last_ok = time.time()
+        self._stale_why = None
+        # a node older than this app cannot expire a stuck payment, so it
+        # would go on claiming the money is coming — worth saying once
+        if "pending" not in a and not self._old_node_warned:
+            self._old_node_warned = True
+            self.toast("The node you're connected to is an older version — "
+                       "it can't report payments still in flight. Update it "
+                       "to see them.", "warn")
         self._avail = a["spendable"]
-        self._history = a["history"]
+        self._history = a.get("history", [])
         self._pending = pending
-        self.avail_var.set(format_ksl(a["spendable"]))
-        self.immature_var.set(format_ksl(a["confirmed"] - a["spendable"]))
+        self._ttl = a.get("mempool_ttl", MEMPOOL_TTL)
+        if a.get("height"):
+            self.tip_height = max(self.tip_height, a["height"])
+        self.avail_od.set(a["spendable"] / params.COIN)
+        self.immature_var.set(
+            format_ksl(a["confirmed"] - a["spendable"]))
         self.total_var.set(format_ksl(a["confirmed"]))
-        p_in = sum(p["delta"] for p in pending if p["delta"] > 0)
-        p_out = -sum(p["delta"] for p in pending if p["delta"] < 0)
+        p_in = a.get("pending_in",
+                     sum(p["delta"] for p in pending if p["delta"] > 0))
+        p_out = a.get("pending_out",
+                      -sum(p["delta"] for p in pending if p["delta"] < 0))
         if p_in and p_out:
-            self.pending_var.set(f"+{format_ksl(p_in)} / "
-                                 f"−{format_ksl(p_out)}")
+            self.pending_var.set(f"+{format_ksl(p_in)} / −{format_ksl(p_out)}")
         elif p_in:
             self.pending_var.set("+" + format_ksl(p_in))
         elif p_out:
             self.pending_var.set("−" + format_ksl(p_out))
         else:
             self.pending_var.set("—")
+        self._paint_pending_note()
         self._validate_send()
         self._paint_tx_tables()
+
+    # -------------------------------------------------- pending, honestly
+    #
+    # An unconfirmed payment is not a yes. Kestrel aims at a block every
+    # two minutes, so anything still waiting after several of those is
+    # worth saying something about, and anything a node will eventually
+    # give up on should say so long before it does. The wallet now always
+    # answers the only question that matters — is it coming, and if it is
+    # taking a while, how long has it been?
+
+    SLOW_AFTER = 6 * 60          # a few blocks' worth of waiting
+    STUCK_AFTER = 40 * 60        # ~20 blocks: something is wrong
+
+    def _pending_state(self, p):
+        """(status text, row tag) for one in-flight payment."""
+        age = p.get("age_seconds", 0) or 0
+        waited = ui.fmt_age(age)
+        if age >= self.STUCK_AFTER:
+            # the full explanation lives in the note under the balance;
+            # the row only has to flag it
+            return f"stuck — {waited}", "stuck"
+        if age >= self.SLOW_AFTER:
+            return f"slow — waiting {waited}", "pend"
+        if age < 30:
+            return "waiting for a block", "pend"
+        return f"waiting {waited}", "pend"
+
+    def _paint_pending_note(self):
+        """The line under the balances explaining anything in flight."""
+        if not hasattr(self, "pend_note"):
+            return
+        worst = max((p.get("age_seconds", 0) or 0 for p in self._pending),
+                    default=0)
+        n = len(self._pending)
+        if not n:
+            text, fg = "", AMBER
+        elif worst >= self.STUCK_AFTER:
+            soonest = min((p.get("expires_in") or 0 for p in self._pending),
+                          default=0)
+            text = (f"{n} payment{'s' if n > 1 else ''} still unconfirmed "
+                    f"after {ui.fmt_age(worst)}. No miner has picked "
+                    f"{'them' if n > 1 else 'it'} up. "
+                    + (f"Your node gives up in {ui.fmt_age(soonest)}, after "
+                       "which the coins are spendable again."
+                       if soonest else
+                       "Nothing is lost — unconfirmed coins were never sent."))
+            fg = RED
+        elif worst >= self.SLOW_AFTER:
+            text = (f"Waiting {ui.fmt_age(worst)} for a block. Kestrel aims "
+                    "at one every two minutes, so this is slower than usual.")
+            fg = AMBER
+        else:
+            text = (f"{n} payment{'s' if n > 1 else ''} on the way — "
+                    "the next block confirms "
+                    + ("them." if n > 1 else "it."))
+            fg = AMBER
+        self.pend_note.configure(text=text, fg=fg)
+        if text and not self.pend_note.winfo_ismapped():
+            self.pend_note.pack(anchor="w", pady=(10, 0), fill="x")
+        elif not text and self.pend_note.winfo_ismapped():
+            self.pend_note.pack_forget()
+
+    STALE_AFTER = 45          # seconds without a good refresh
+
+    def _paint_freshness(self):
+        """Say so when this screen has stopped being current.
+
+        Numbers that quietly stop changing are worse than an error: they
+        look like facts. If the balance is older than a few refresh cycles
+        the window says so rather than presenting stale figures as news.
+        """
+        if not hasattr(self, "updated_var"):
+            return
+        age = time.time() - self._last_ok
+        if age < self.STALE_AFTER:
+            self.updated_var.set("updated " + time.strftime(
+                "%H:%M:%S", time.localtime(self._last_ok)))
+            return
+        self.updated_var.set(f"⚠ not updated for {ui.fmt_age(age)}\n"
+                             + (self._stale_why or "no answer from the node")
+                             [:60])
 
     def _row_of(self, h):
         when = time.strftime("%d %b %Y, %H:%M", time.localtime(h["timestamp"]))
@@ -2328,29 +2532,37 @@ class App(tk.Tk):
         else:
             kind, tag = "Sent", "neg"
         amt = ("+" if h["delta"] >= 0 else "") + format_ksl(h["delta"])
-        confs = max(self.tip_height - h["height"] + 1, 1)
-        if h.get("coinbase") and confs < 10:
-            status = f"Immature {confs}/10"
+        confs = h.get("confirmations")
+        if not confs:
+            confs = max(self.tip_height - h["height"] + 1, 1)
+        if h.get("coinbase") and confs < params.COINBASE_MATURITY:
+            status = f"immature {confs}/{params.COINBASE_MATURITY}"
+        elif confs == 1:
+            status = "1 confirmation"
         else:
-            status = f"{min(confs, 999)} conf"
+            status = f"{min(confs, 9999):,} confirmations"
         return {"when": when, "kind": kind, "txid": h["txid"], "amt": amt,
                 "status": status, "tag": tag, "delta": h["delta"],
-                "height": h.get("height"), "ts": h["timestamp"]}
+                "height": h.get("height"), "ts": h["timestamp"],
+                "age": None}
 
     def _pending_row(self, p):
-        when = time.strftime("%d %b %Y, %H:%M", time.localtime(p["timestamp"]))
-        kind = "Sending" if p["outgoing"] else "Receiving"
+        seen = p.get("first_seen") or p.get("timestamp", time.time())
+        when = time.strftime("%d %b %Y, %H:%M", time.localtime(seen))
+        kind = "Sending" if p.get("outgoing") else "Receiving"
         amt = ("+" if p["delta"] >= 0 else "") + format_ksl(p["delta"])
+        status, tag = self._pending_state(p)
         return {"when": when, "kind": kind, "txid": p["txid"], "amt": amt,
-                "status": "Pending", "tag": "pend", "delta": p["delta"],
-                "height": None, "ts": p["timestamp"]}
+                "status": status, "tag": tag, "delta": p["delta"],
+                "height": None, "ts": seen,
+                "age": p.get("age_seconds", 0)}
 
     def _match_tx_filter(self, r):
         f = self._tx_filter
         if f == "All":
             return True
         if f == "Pending":
-            return r["status"] == "Pending"
+            return r["age"] is not None
         return {"Sent": ("Sent", "Sending"),
                 "Received": ("Received", "Receiving"),
                 "Mined": ("Mined",)}.get(f, ()).__contains__(r["kind"])
@@ -2358,8 +2570,9 @@ class App(tk.Tk):
     def _paint_tx_tables(self):
         if not hasattr(self, "recent_tv"):
             return
-        rows = [self._pending_row(p)
-                for p in sorted(self._pending, key=lambda p: -p["ts"])]
+        rows = [self._pending_row(p) for p in sorted(
+            self._pending,
+            key=lambda p: -(p.get("first_seen") or p.get("timestamp") or 0))]
         rows += [self._row_of(h) for h in self._history]
         self._rows = rows
 
@@ -2398,10 +2611,13 @@ class App(tk.Tk):
                                 "filter, or share your Receive address")
             self._zebra(self.tx_tv)
             note = f"{shown} shown"
-            if len(self._history) >= 50:
-                note += " · showing the most recent 50 confirmed"
+            if len(self._history) >= 200:
+                note += " · most recent 200 confirmed"
+            if self._pending:
+                note += f" · {len(self._pending)} still in flight"
             self.tx_count_var.set(note)
         self.updated_var.set("updated " + time.strftime("%H:%M:%S"))
+        self._paint_freshness()
 
     # ---------------------------------------------------------------- send
     def fill_max(self):
