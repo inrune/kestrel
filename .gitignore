@@ -30,6 +30,20 @@ seeds.txt
 *-settings.json
 **/*-settings.json
 
+# --- Diagnostics written beside the apps (v1.4.8+). Machine-specific, and
+#     may quote addresses and peer IPs from this install.
+kestrel-log.txt
+**/kestrel-log.txt
+kestrel-log.txt.1
+**/kestrel-log.txt.1
+
+# --- The updater's own staging area, and the address book, which is the
+#     operator's list of who they pay
+.kestrel-update/
+**/.kestrel-update/
+kestrel-address-book.json
+**/kestrel-address-book.json
+
 # --- Multi-node test directories (node1/, node2/, …)
 node[0-9]*/
 **/node[0-9]*/
