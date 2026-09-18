@@ -30,6 +30,10 @@ EXCLUDES=(
   '*-settings.json' '*/*-settings.json'     # miner/wallet local settings
   'seeds.txt' '*/seeds.txt'                 # operator's live seed list
   '*seeds-cache.txt' '*dht-nodes.json'      # discovery caches
+  'kestrel-log.txt' '*/kestrel-log.txt'     # this machine's diagnostics
+  'kestrel-log.txt.1' '*/kestrel-log.txt.1'
+  '*/.kestrel-update/*' '*.kestrel-update*' # half-downloaded updates
+  '*kestrel-address-book.json'              # the operator's own contacts
   '.DS_Store' '*/.DS_Store' '*/.git/*' '*.zip'
 )
 
@@ -57,15 +61,16 @@ command -v zip >/dev/null 2>&1 || {
   exit 1
 }
 
+built=()
 for f in "${FOLDERS[@]}"; do
   [[ -d "$f" ]] || { echo "skip: $f/ not found"; continue; }
   out="$f.zip"
   rm -f "$out"
   # zip the folder itself (so it extracts into "$f/"), minus the excludes
   zip -r -q "$out" "$f" "${zip_excludes[@]}"
+  built+=("$out")
   printf '  built %-20s %s\n' "$out" "$(du -h "$out" | cut -f1)"
 done
 
 echo
-echo "Done. Upload these three zips wherever your download links point"
-echo "(GitHub Releases, or next to kestrel-website.html on your host)."
+echo "Done. Upload the three zips to the GitHub Release."
