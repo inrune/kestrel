@@ -8,14 +8,3 @@ body: Fixes a bug where switching to a heavier chain could freeze the
   get stranded behind a router, and an optional beta channel if you
   want to try new versions early. Full notes on the releases page.
 link: https://github.com/inrune/kestrel/releases/tag/v1.4.9
----
-
-id: 2026-09-telegram-group
-date: 2026-09-03
-level: info
-title: Kestrel now has a community chat
-body: A Telegram group for people running Kestrel — a place to ask
-  questions, trade tips on mining setups, and talk to others on the
-  network. Not run by anyone claiming special access to your wallet:
-  nobody there will ever ask for your key or your wallet file.
-link: https://t.me/+m72FpLnBhag0YzRk
