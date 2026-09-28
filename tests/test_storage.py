@@ -16,8 +16,7 @@ import tempfile
 import unittest
 
 from kestrel import params
-from kestrel.blockchain import Blockchain, ValidationError
-from kestrel.block import Block
+from kestrel.blockchain import Blockchain
 from kestrel.miner import mine
 from kestrel.wallet import Wallet
 

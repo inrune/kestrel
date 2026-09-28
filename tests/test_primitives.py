@@ -4,7 +4,7 @@ import unittest
 
 from kestrel import params
 from kestrel.crypto_utils import generate_private_key, private_to_public, pubkey_to_address
-from kestrel.transaction import Transaction, TxInput, TxOutput, COINBASE_TXID, COINBASE_VOUT
+from kestrel.transaction import Transaction, TxInput, TxOutput
 from kestrel.block import Block, build_genesis, merkle_root
 from kestrel.wallet import Wallet, format_ksl, parse_ksl
 from kestrel.blockchain import ValidationError

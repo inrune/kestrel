@@ -1,13 +1,11 @@
 """Consensus engine: emission schedule, mining, maturity, reorgs, persistence."""
 
-import copy
 import tempfile
 import unittest
 
 from kestrel import params
 from kestrel.blockchain import Blockchain, ValidationError
-from kestrel.block import Block
-from kestrel.transaction import Transaction, TxInput, TxOutput
+from kestrel.transaction import TxOutput
 from kestrel.wallet import Wallet, parse_ksl
 from kestrel.miner import mine, assemble_candidate
 

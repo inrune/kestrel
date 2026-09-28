@@ -14,7 +14,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 import zipfile
 
@@ -59,6 +58,41 @@ class TestVersions(unittest.TestCase):
         self.assertFalse(updates.is_newer("1.4.7", "1.4.8"))
         self.assertFalse(updates.is_newer("", "1.4.8"))
         self.assertFalse(updates.is_newer("garbage", "1.4.8"))
+
+    def test_betas_sit_between_releases(self):
+        seq = ["1.4.9", "1.5.0-alpha", "1.5.0-beta.1", "1.5.0b2",
+               "v1.5.0-rc1", "1.5.0", "1.5.1"]
+        for older, newer in zip(seq, seq[1:]):
+            self.assertTrue(updates.is_newer(newer, older), (newer, older))
+            self.assertFalse(updates.is_newer(older, newer), (older, newer))
+        # the tag and the __version__ inside the zip may be spelled apart
+        self.assertEqual(updates._parse("v1.5.0-beta.1"),
+                         updates._parse("1.5.0b1"))
+        self.assertTrue(updates.is_prerelease("1.5.0-beta.1"))
+        self.assertFalse(updates.is_prerelease("1.5.0"))
+
+    def test_only_opting_in_offers_a_beta(self):
+        def rel(tag, pre=False, draft=False):
+            return {"tag_name": tag, "prerelease": pre, "draft": draft,
+                    "assets": [], "body": "", "html_url": "https://x"}
+        listing = [rel("v1.6.0-beta.1", draft=True),
+                   rel("v1.5.0-beta.2", pre=True), rel("v1.4.9")]
+        answers = {updates.RELEASES_API: rel("v1.4.9"),
+                   updates.RELEASES_LIST: listing}
+        real = updates._get
+        updates._get = lambda url, timeout=0: json.dumps(answers[url]).encode()
+        try:
+            self.assertEqual(updates.fetch_latest()["version"], "v1.4.9")
+            got = updates.fetch_latest(beta=True)
+            self.assertEqual(got["version"], "v1.5.0-beta.2")   # no drafts
+            self.assertTrue(got["prerelease"])
+            self.assertEqual(updates.label(got), "1.5.0-beta.2 (beta)")
+            # once the full release is out, a beta tester is offered it
+            listing.insert(0, rel("v1.5.0"))
+            self.assertEqual(updates.fetch_latest(beta=True)["version"],
+                             "v1.5.0")
+        finally:
+            updates._get = real
 
     def test_asset_for_this_app(self):
         assets = [{"name": "kestrel-core.zip", "url": "c", "size": 1},

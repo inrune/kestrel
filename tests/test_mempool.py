@@ -7,7 +7,6 @@ closing the app and opening it again was, literally, the only way to find
 out the truth. Running and restarted now agree.
 """
 
-import os
 import tempfile
 import time
 import unittest
