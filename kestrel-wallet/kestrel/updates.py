@@ -3,9 +3,9 @@ Kestrel updates — find a newer release, and install it if the user says so.
 
 Nothing here happens on its own. The check is quiet and optional; the
 download only starts after someone clicks a button; and the swap only
-runs after the download has been checked — against a SHA256SUMS file if
-the release publishes one, and in every case against the zip's own
-contents and version.
+runs after the download has been checked — against the SHA-256 GitHub
+publishes for every release file, and in every case against the zip's
+own contents and version.
 
 What the update is allowed to touch is deliberately narrow. Code and docs
 are replaced. The wallet file, the address book, settings and the local
@@ -27,12 +27,9 @@ import json
 import os
 import re
 import shutil
-import ssl
 import subprocess
 import sys
-import tempfile
 import threading
-import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -41,6 +38,9 @@ from . import __version__ as CURRENT
 
 REPO = "inrune/kestrel"
 RELEASES_API = f"https://api.github.com/repos/{REPO}/releases/latest"
+# every release, newest first — the only way to see pre-releases, which
+# /releases/latest leaves out by design
+RELEASES_LIST = f"https://api.github.com/repos/{REPO}/releases?per_page=20"
 RELEASES_PAGE = f"https://github.com/{REPO}/releases"
 TIMEOUT = 12
 MAX_DOWNLOAD = 200 * 1024 * 1024        # a Kestrel app is a few MB; cap it
@@ -55,7 +55,16 @@ KEEP = {
     "seeds.txt",
     "kestrel-data",                     # ledger, peers, discovery caches
     ".kestrel-update",                  # our own staging area
+    "kestrel-log.txt",                  # this machine's diagnostics
+    "kestrel-log.txt.1",
+    ".venv", "venv",                    # a launcher-made Python environment
 }
+
+# Anything whose name starts like this is key material too — the wallet's
+# own temp file, and the copies it sets aside before it will ever replace
+# a wallet ("kestrel-wallet.json.replaced-<time>.bak"). None of it is
+# read, copied or backed up by an update.
+KEEP_PREFIXES = ("kestrel-wallet",)
 
 # What a valid extracted app must contain before we are willing to swap.
 REQUIRED = ("app.py", os.path.join("kestrel", "__init__.py"))
@@ -63,18 +72,47 @@ REQUIRED = ("app.py", os.path.join("kestrel", "__init__.py"))
 
 # --------------------------------------------------------------- versions
 
+_PRE_RANK = {"a": 0, "alpha": 0, "dev": 0, "b": 1, "beta": 1, "pre": 1,
+             "preview": 1, "c": 2, "rc": 2}
+
+
 def _parse(v: str) -> tuple:
-    """'v1.4.5' -> (1, 4, 5). Unparseable pieces become 0."""
-    nums = re.findall(r"\d+", v or "")
-    return tuple(int(n) for n in nums[:4]) or (0,)
+    """A version as something that sorts the way people expect.
+
+    'v1.4.5' -> (1, 4, 5, 0, (3, 0)). A pre-release sorts BEFORE the
+    release it leads up to and after the one before it, so
+    1.4.9 < 1.5.0-alpha < 1.5.0-beta.1 < 1.5.0-beta.2 < 1.5.0-rc1 < 1.5.0.
+    Accepts "1.5.0-beta.1", "1.5.0b1", "v1.5.0 beta 1" and the like.
+    Nothing parseable gives (0,), which is never newer than anything.
+    """
+    m = re.match(r"\s*[vV]?(\d+(?:\.\d+){0,3})(.*)$", v or "")
+    if not m:
+        return (0,)
+    nums = [int(n) for n in m.group(1).split(".")]
+    nums += [0] * (4 - len(nums))
+    rest = m.group(2).split("+", 1)[0].strip(" -_.").lower()
+    if not rest:
+        pre = (3, 0)                                   # a final release
+    else:
+        word = re.match(r"[a-z]*", rest).group(0)
+        num = re.search(r"\d+", rest)
+        pre = (_PRE_RANK.get(word, 0), int(num.group(0)) if num else 0)
+    return tuple(nums) + (pre,)
+
+
+def is_prerelease(v: str) -> bool:
+    key = _parse(v)
+    return len(key) > 1 and key[-1][0] < 3
 
 
 def is_newer(latest: str, current: str = CURRENT) -> bool:
-    a, b = _parse(latest), _parse(current)
-    n = max(len(a), len(b))
-    a += (0,) * (n - len(a))
-    b += (0,) * (n - len(b))
-    return a > b
+    return _parse(latest) > _parse(current)
+
+
+def label(rel: dict) -> str:
+    """How to name a release to a person: '1.5.0-beta.1 (beta)'."""
+    v = str(rel.get("version", "")).lstrip("vV")
+    return v + (" (beta)" if rel.get("prerelease") else "")
 
 
 # ------------------------------------------------------------- the check
@@ -87,35 +125,72 @@ def _get(url: str, timeout: int = TIMEOUT) -> bytes:
         return r.read()
 
 
-def fetch_latest() -> dict | None:
+def _release(data) -> dict | None:
+    """One release from GitHub's API, in the shape the apps use."""
+    if not isinstance(data, dict) or data.get("draft"):
+        return None
+    tag = (data.get("tag_name") or data.get("name") or "").strip()
+    if not tag:
+        return None
+    assets = [{"name": a.get("name", ""),
+               "url": a.get("browser_download_url", ""),
+               "size": int(a.get("size") or 0),
+               "sha256": asset_sha256(a)}
+              for a in (data.get("assets") or [])
+              if isinstance(a, dict) and a.get("browser_download_url")]
+    return {
+        "version": tag,
+        "prerelease": bool(data.get("prerelease")) or is_prerelease(tag),
+        "notes": (data.get("body") or "").strip(),
+        "url": data.get("html_url") or RELEASES_PAGE,
+        "assets": assets,
+    }
+
+
+def fetch_latest(beta: bool = False) -> dict | None:
     """The newest published release, or None if we can't tell.
 
-    Returns {version, notes, url, assets: [{name, url, size}]}. Never
-    raises: offline, rate-limited or no releases at all all mean "say
-    nothing", which is better than nagging about a failure the person
-    can do nothing about.
+    With `beta`, pre-releases count too: whichever is newer, the newest
+    beta or the newest full release, wins — so someone on a beta moves on
+    to the final version when it comes out. Without it, only full
+    releases are ever offered.
+
+    Returns {version, prerelease, notes, url, assets: [{name, url, size,
+    sha256}]}. Never raises: offline, rate-limited or no releases at all
+    all mean "say nothing", which is better than nagging about a failure
+    the person can do nothing about.
     """
     try:
-        data = json.loads(_get(RELEASES_API).decode())
-        tag = (data.get("tag_name") or data.get("name") or "").strip()
-        if not tag:
-            return None
-        assets = [{"name": a.get("name", ""),
-                   "url": a.get("browser_download_url", ""),
-                   "size": int(a.get("size") or 0)}
-                  for a in (data.get("assets") or [])
-                  if a.get("browser_download_url")]
-        return {
-            "version": tag,
-            "notes": (data.get("body") or "").strip(),
-            "url": data.get("html_url") or RELEASES_PAGE,
-            "assets": assets,
-        }
+        if not beta:
+            return _release(json.loads(_get(RELEASES_API).decode()))
+        listed = json.loads(_get(RELEASES_LIST).decode())
+        best = None
+        for data in listed if isinstance(listed, list) else []:
+            rel = _release(data)
+            if rel and (best is None
+                        or _parse(rel["version"]) > _parse(best["version"])):
+                best = rel
+        return best
     except Exception:
         return None
 
 
-def check(callback):
+def asset_sha256(asset: dict) -> str | None:
+    """The SHA-256 GitHub computed for an uploaded release file.
+
+    Since June 2025 GitHub publishes one for every release asset, as
+    "digest": "sha256:<hex>". It is worked out by GitHub from the file it
+    actually stores, so nobody has to maintain a checksum file by hand.
+    """
+    d = asset.get("digest") if isinstance(asset, dict) else None
+    if isinstance(d, str) and d.lower().startswith("sha256:"):
+        h = d.split(":", 1)[1].strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", h):
+            return h
+    return None
+
+
+def check(callback, beta: bool = False):
     """Run the check in the background.
 
     ``callback(release)`` is called only when there really is a newer
@@ -123,7 +198,7 @@ def check(callback):
     produce a misleading 'you're up to date' either way.
     """
     def run():
-        rel = fetch_latest()
+        rel = fetch_latest(beta)
         if rel and is_newer(rel["version"]):
             try:
                 callback(rel)
@@ -253,6 +328,32 @@ def _safe_extract(zf: zipfile.ZipFile, into: str):
         if target != root and not target.startswith(root + os.sep):
             raise ValueError(f"unsafe path in the update archive: {name}")
     zf.extractall(into)
+    _restore_modes(zf, into)
+
+
+def _restore_modes(zf: zipfile.ZipFile, into: str):
+    """Put back the permission bits the archive recorded.
+
+    zipfile.extractall ignores them, so every file comes out as plain
+    read/write — which on macOS and Linux turned run.sh into a file the
+    launcher could no longer run, straight after an update that otherwise
+    worked. Only the ordinary rwx bits are restored, never setuid and
+    friends; and whatever the archive says, a .sh launcher is executable.
+    """
+    if os.name == "nt":
+        return
+    for member in zf.infolist():
+        if member.is_dir():
+            continue
+        path = os.path.join(into, member.filename)
+        mode = (member.external_attr >> 16) & 0o777
+        if member.filename.endswith(".sh"):
+            mode |= 0o755
+        if mode:
+            try:
+                os.chmod(path, mode | 0o600)
+            except OSError:
+                pass
 
 
 def _find_app_root(base: str) -> str | None:
@@ -321,6 +422,7 @@ import json, os, shutil, subprocess, sys, time
 cfg = json.load(open(sys.argv[1], encoding="utf-8"))
 APP, NEW, BACKUP = cfg["app_dir"], cfg["staged"], cfg["backup"]
 KEEP, PID, RELAUNCH = set(cfg["keep"]), cfg["pid"], cfg["relaunch"]
+KEEP_PREFIXES = tuple(cfg.get("keep_prefixes") or ("kestrel-wallet",))
 LOG = os.path.join(os.path.dirname(BACKUP), "update.log")
 
 
@@ -359,23 +461,61 @@ def running(pid):
         return True
 
 
+def kept(name):
+    return name in KEEP or name.startswith(KEEP_PREFIXES)
+
+
 def tree(root):
     """Every relative path under root, minus the keep-list."""
     found = []
     for base, dirs, files in os.walk(root):
         rel_base = os.path.relpath(base, root)
         parts = [] if rel_base == "." else rel_base.split(os.sep)
-        if parts and parts[0] in KEEP:
+        if parts and kept(parts[0]):
             dirs[:] = []
             continue
         dirs[:] = [d for d in dirs
-                   if not (not parts and d in KEEP) and d != "__pycache__"]
+                   if not (not parts and kept(d)) and d != "__pycache__"]
         for f in files:
             rel = f if not parts else os.path.join(*parts, f)
-            if rel.split(os.sep)[0] in KEEP or f.endswith((".pyc", ".pyo")):
+            if kept(rel.split(os.sep)[0]) or f.endswith((".pyc", ".pyo")):
                 continue
             found.append(rel)
     return found
+
+
+def shipped_code(rel):
+    """Is this a file an older release shipped, that is safe to delete if
+    the new release no longer has it? Only the package's own Python.
+
+    Anything else in the folder may be the person's: notes, exports, a
+    backup key saved as a .txt. The old rule deleted every .txt, .md, .py,
+    .bat and .sh the new version didn't ship — which included exactly
+    those. An unused top-level file left behind costs nothing.
+    """
+    parts = rel.split(os.sep)
+    return len(parts) >= 2 and parts[0] == "kestrel" and rel.endswith(".py")
+
+
+def restart():
+    try:
+        kw = {"cwd": APP, "close_fds": True}
+        if os.name == "nt":
+            kw["creationflags"] = 0x00000008 | 0x00000200   # DETACHED | NEW_GROUP
+        else:
+            kw["start_new_session"] = True
+        subprocess.Popen(RELAUNCH, **kw)
+        say("restarted")
+    except Exception as e:
+        say(f"could not restart automatically ({e}) — start Kestrel yourself")
+
+
+def give_up(msg):
+    """Leave the installed version as it is — and start it again, since
+    the person asked for an update, not for their app to vanish."""
+    say(msg)
+    restart()
+    sys.exit(1)
 
 
 WAIT = float(cfg.get("wait_seconds") or 60)
@@ -398,21 +538,25 @@ say(f"{len(old)} existing file(s), {len(new)} in the update")
 # delete the app and put nothing back in its place.
 missing = [r for r in cfg["required"] if not os.path.exists(os.path.join(NEW, r))]
 if not new or missing:
-    say(f"the staged update is not a complete app (missing {missing or 'everything'})"
-        " — leaving the installed version alone")
-    sys.exit(1)
+    give_up(f"the staged update is not a complete app (missing {missing or 'everything'})"
+            " — leaving the installed version alone")
+
+new_set = set(new)
+stale = [r for r in old if r not in new_set and shipped_code(r)]
+# Only what the update will overwrite or remove is backed up: that is all a
+# rollback needs, and it keeps the person's own files out of the copy.
+affected = [r for r in old if r in new_set] + stale
 
 # 1. keep a copy of what we are about to replace
 shutil.rmtree(BACKUP, ignore_errors=True)
 os.makedirs(BACKUP, exist_ok=True)
 try:
-    for rel in old:
+    for rel in affected:
         dst = os.path.join(BACKUP, rel)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(os.path.join(APP, rel), dst)
 except Exception as e:
-    say(f"could not back up ({e}) — refusing to update")
-    sys.exit(1)
+    give_up(f"could not back up ({e}) — refusing to update")
 
 # 2. copy the new files in, then remove code the new version dropped
 try:
@@ -420,6 +564,10 @@ try:
         dst = os.path.join(APP, rel)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(os.path.join(NEW, rel), dst)
+        if os.name != "nt" and rel.endswith(".sh"):
+            # a launcher that has lost its execute bit is a launcher
+            # that no longer launches
+            os.chmod(dst, os.stat(dst).st_mode | 0o755)
     short = [r for r in cfg["required"] if not os.path.exists(os.path.join(APP, r))]
     if short:
         raise RuntimeError(f"{short} did not make it across")
@@ -434,16 +582,15 @@ try:
             if d == "__pycache__":
                 shutil.rmtree(os.path.join(base, d), ignore_errors=True)
                 dirs.remove(d)
-    for rel in set(old) - set(new):
-        if rel.endswith((".py", ".md", ".txt", ".bat", ".sh")):
-            try:
-                os.remove(os.path.join(APP, rel))
-            except OSError:
-                pass
+    for rel in stale:
+        try:
+            os.remove(os.path.join(APP, rel))
+        except OSError:
+            pass
     say("update applied")
 except Exception as e:
     say(f"update failed ({e}) — putting the old files back")
-    for rel in old:
+    for rel in affected:
         src = os.path.join(BACKUP, rel)
         if os.path.exists(src):
             dst = os.path.join(APP, rel)
@@ -452,19 +599,19 @@ except Exception as e:
                 shutil.copy2(src, dst)
             except Exception:
                 pass
+    # and take out what the half-applied update added, so the old code
+    # does not start up next to modules from a version it never knew
+    old_set = set(old)
+    for rel in new:
+        if rel not in old_set and shipped_code(rel):
+            try:
+                os.remove(os.path.join(APP, rel))
+            except OSError:
+                pass
     say("rolled back")
 
-# 3. start the new version
-try:
-    kw = {"cwd": APP, "close_fds": True}
-    if os.name == "nt":
-        kw["creationflags"] = 0x00000008 | 0x00000200   # DETACHED | NEW_GROUP
-    else:
-        kw["start_new_session"] = True
-    subprocess.Popen(RELAUNCH, **kw)
-    say("restarted")
-except Exception as e:
-    say(f"could not restart automatically ({e}) — start Kestrel yourself")
+# 3. start the new version (or the old one, if it was rolled back)
+restart()
 '''
 
 
@@ -514,7 +661,8 @@ def apply_update(app_dir: str, staged: str, relaunch: list) -> subprocess.Popen:
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump({"app_dir": app_dir, "staged": staged,
                    "backup": os.path.join(staging, "previous-version"),
-                   "keep": sorted(KEEP), "required": list(REQUIRED),
+                   "keep": sorted(KEEP), "keep_prefixes": list(KEEP_PREFIXES),
+                   "required": list(REQUIRED),
                    "pid": os.getpid(), "relaunch": relaunch,
                    "wait_seconds": 60}, f)
     kw = {"cwd": staging, "close_fds": True}
@@ -552,13 +700,21 @@ def install(release: dict, app: str, app_dir: str, app_file: str, *,
     shutil.rmtree(staging, ignore_errors=True)
     os.makedirs(staging, exist_ok=True)
 
-    # A SHA256SUMS file is optional. When the release publishes one the
-    # download is checked against it; when it doesn't, the download still
-    # has to be a well-formed Kestrel zip of the expected version.
-    sums = published_checksums(release.get("assets") or [])
-    expect = sums.get(asset["name"])
-    if expect:
-        step("Checking the published checksum…")
+    # The download is checked against the SHA-256 GitHub publishes for the
+    # file, or failing that a SHA256SUMS file if a release carries one,
+    # and it still has to be a well-formed Kestrel zip of the expected
+    # version. GitHub publishes a digest for every release file, so one
+    # with neither is not something to install blind.
+    expect = asset.get("sha256")
+    if not expect:
+        expect = published_checksums(release.get("assets") or []).get(
+            asset["name"])
+    if not expect:
+        raise ValueError(
+            "GitHub did not list a checksum for this download, so it "
+            "can't be verified. Try again later, or download it from the "
+            "releases page yourself.")
+    step("Checking the published checksum…")
 
     step(f"Downloading {asset['name']}…")
     zip_path = os.path.join(staging, asset["name"])
@@ -572,6 +728,78 @@ def install(release: dict, app: str, app_dir: str, app_file: str, *,
     relaunch = relaunch_command(app_file)
     apply_update(app_dir, staged, relaunch)
     return relaunch
+
+
+def after_update(app_dir: str) -> list:
+    """Repair what older updaters got wrong. Run at every start; cheap.
+
+    An update is applied by the script of the version being *replaced*,
+    so the fixes in this file only protect the update after this one.
+    Coming from 1.4.8, the old script has already run, and it:
+
+      * deleted every .txt, .md, .py, .bat and .sh in the app folder that
+        the new release didn't ship — people's own notes and exports, and
+        possibly a backup key saved as a text file. It did copy them into
+        .kestrel-update/previous-version first, and that copy is erased
+        by the NEXT update, so this is the moment to put them back;
+      * extracted the new release without its permission bits, so on
+        macOS and Linux run.sh could no longer be run.
+
+    Returns the relative paths put back (empty almost always).
+    """
+    restored = []
+    if os.name != "nt":
+        for name in os.listdir(app_dir) if os.path.isdir(app_dir) else []:
+            if name.endswith(".sh"):
+                path = os.path.join(app_dir, name)
+                try:
+                    mode = os.stat(path).st_mode
+                    if not mode & 0o100:
+                        os.chmod(path, mode | 0o755)
+                except OSError:
+                    pass
+
+    staging = os.path.join(app_dir, ".kestrel-update")
+    prev = os.path.join(staging, "previous-version")
+    marker = os.path.join(staging, "recovered")
+    if not os.path.isdir(prev):
+        return restored
+    try:
+        with open(marker, encoding="utf-8") as f:
+            if f.read().strip() == CURRENT:
+                return restored        # already done for this version
+    except OSError:
+        pass
+    for base, dirs, files in os.walk(prev):
+        rel_base = os.path.relpath(base, prev)
+        parts = [] if rel_base == "." else rel_base.split(os.sep)
+        # the package itself is code: anything missing there was removed
+        # on purpose. Everything else was the person's.
+        dirs[:] = [d for d in dirs if d != "__pycache__"
+                   and not (not parts and (d == "kestrel" or d in KEEP))]
+        for f in files:
+            if f.endswith((".pyc", ".pyo")):
+                continue
+            rel = os.path.join(*parts, f) if parts else f
+            # No name-based skipping here: 1.4.8 had no prefix rule, so a
+            # "kestrel-wallet-backup.txt" is exactly the kind of file it
+            # deleted. Only missing paths are filled, so nothing that is
+            # there now — a wallet above all — is ever overwritten.
+            dst = os.path.join(app_dir, rel)
+            if os.path.exists(dst):
+                continue
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(os.path.join(base, f), dst)
+                restored.append(rel)
+            except OSError:
+                pass
+    try:
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write(CURRENT)
+    except OSError:
+        pass
+    return restored
 
 
 def cleanup(app_dir: str):

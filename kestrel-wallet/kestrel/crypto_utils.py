@@ -14,7 +14,7 @@ Kestrel cryptographic primitives.
 import hashlib
 import os
 
-from ecdsa import SigningKey, VerifyingKey, SECP256k1, BadSignatureError
+from ecdsa import SigningKey, VerifyingKey, SECP256k1
 from ecdsa.util import sigencode_der_canonize, sigdecode_der
 
 from . import params

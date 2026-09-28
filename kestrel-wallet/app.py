@@ -61,8 +61,7 @@ def _enable_dpi():
 _enable_dpi()
 
 import tkinter as tk                                          # noqa: E402
-from tkinter import ttk, filedialog                           # noqa: E402
-from tkinter import font as tkfont                            # noqa: E402
+from tkinter import filedialog                                # noqa: E402
 
 WALLET_FILE = os.path.join(_HERE, "kestrel-wallet.json")
 BOOK_FILE = os.path.join(_HERE, "kestrel-address-book.json")
@@ -107,12 +106,35 @@ def _resolve_fonts(root, scale=1.0):
     MONO_26B = F["mono_huge"]
 
 
-def http_json(method, url, payload=None, timeout=10):
+def http_json(method, url, payload=None, timeout=10,
+              max_bytes=32 * 1024 * 1024):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, method=method,
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json",
+                                          "User-Agent": f"kestrel-wallet/{KVER}"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read())
+        raw = resp.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError("the node sent far more than was asked for")
+    return json.loads(raw)
+
+
+def _write_json_atomic(path, data):
+    """Whole file or no change. A crash in the middle of the old in-place
+    write left an empty file behind — the address book, or the settings
+    that remember whether the backup key was ever saved."""
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def kestrel_at(url, timeout=1.5):
@@ -136,18 +158,14 @@ def port_free(p):
 
 def load_settings() -> dict:
     try:
-        with open(SETTINGS_FILE) as fh:
+        with open(SETTINGS_FILE, encoding="utf-8") as fh:
             return dict(json.load(fh))
     except Exception:
         return {}
 
 
 def save_settings(d: dict):
-    try:
-        with open(SETTINGS_FILE, "w") as fh:
-            json.dump(d, fh, indent=2)
-    except Exception:
-        pass
+    _write_json_atomic(SETTINGS_FILE, d)
 
 
 def open_folder(path):
@@ -530,6 +548,15 @@ class App(ui.Resilient, tk.Tk):
         # Diagnostics go to kestrel-log.txt beside the app, and the
         # console stays clean — see kestrel/logfile.py.
         logfile.setup(_HERE, "wallet", quiet=True)
+        # put right anything an older version's updater got wrong
+        try:
+            self._recovered = updates.after_update(_HERE)
+        except Exception as e:
+            self._recovered = []
+            logfile.exception("after update", e)
+        if self._recovered:
+            logfile.write("restored after update: "
+                          + ", ".join(self._recovered), level="warn")
         _resolve_fonts(self)
         self.title(f"Kestrel Wallet {KVER}")
         self.configure(bg=DUSK)
@@ -547,6 +574,7 @@ class App(ui.Resilient, tk.Tk):
         self._avail = 0
         self._history = []
         self._pending = []
+        self._sent_log = []           # (txid, to, total, when) sent from here
         self._ttl = MEMPOOL_TTL
         self._last_ok = time.time()   # when the balance last really loaded
         self._stale_why = None
@@ -566,6 +594,17 @@ class App(ui.Resilient, tk.Tk):
         self._ensure_wallet()
         threading.Thread(target=self._auto_node, daemon=True).start()
         self._start_loops()
+        if self._recovered:
+            names = "\n".join("  • " + r for r in self._recovered[:12])
+            more = len(self._recovered) - 12
+            self.after(1800, lambda: self._say_when_free(
+                "Your files are back",
+                "The previous version's updater removed some files of yours "
+                "from this folder while installing. They have been put "
+                "back:\n\n" + names + (f"\n  …and {more} more" if more > 0
+                                        else "") +
+                "\n\nNothing else was changed, and future updates never "
+                "remove anything but the app's own code."))
         self._check_updates()
         self.protocol("WM_DELETE_WINDOW", self._quit)
 
@@ -651,14 +690,16 @@ class App(ui.Resilient, tk.Tk):
             self.wallet.save(WALLET_FILE)
             self.settings["backed_up"] = False
             save_settings(self.settings)
-            self._say(
+            # after the window is up, so the node search starts behind it
+            w = self.wallet
+            self.after(600, lambda: self._say(
                 "Welcome to Kestrel",
                 "Your wallet is ready.\n\nAddress (share to receive):\n"
-                + self.wallet.address +
+                + w.address +
                 "\n\nBackup key (keep secret):\n"
-                + private_to_wif(self.wallet.private_key) +
+                + private_to_wif(w.private_key) +
                 "\n\nWrite the backup key down now — it is the only way to "
-                "restore your coins. File ▸ Backup saves it as a file.")
+                "restore your coins. File ▸ Backup saves it as a file."))
         if self.wallet:
             self.addr_var.set(self.wallet.address)
             self._draw_qr()
@@ -817,7 +858,8 @@ class App(ui.Resilient, tk.Tk):
             self.q.put(("update", rel, manual))
 
         def run():
-            rel = updates.fetch_latest()
+            rel = updates.fetch_latest(
+                beta=bool(self.settings.get("beta_updates", False)))
             if rel and updates.is_newer(rel["version"]):
                 self.q.put(("update", rel, manual))
             elif manual:
@@ -837,12 +879,12 @@ class App(ui.Resilient, tk.Tk):
 
     def _update_dialog(self, rel):
         can, why = updates.can_install(_HERE)
-        top = self._dialog(f"Kestrel {rel['version']} is available")
+        top = self._dialog(f"Kestrel {updates.label(rel)} is available")
         tk.Frame(top, bg=RUFOUS, height=3).pack(fill="x")
         body = tk.Frame(top, bg=DUSK2, padx=24, pady=20)
         body.pack(fill="both", expand=True)
 
-        tk.Label(body, text=f"Kestrel {rel['version']} is available",
+        tk.Label(body, text=f"Kestrel {updates.label(rel)} is available",
                  bg=DUSK2, fg=BUFF, font=H2, anchor="w").pack(fill="x")
         tk.Label(body, text=f"You have {KVER}.", bg=DUSK2, fg=FAINT,
                  font=SANS_9, anchor="w").pack(fill="x", pady=(2, 0))
@@ -937,7 +979,7 @@ class App(ui.Resilient, tk.Tk):
         if not hasattr(self, "update_chip"):
             return
         self.update_chip.configure(
-            text=f"  ⬆  Update to {rel['version']}  ",
+            text=f"  ⬆  Update to {updates.label(rel)}  ",
             command=lambda: self._update_dialog(rel))
         if not self.update_chip.winfo_ismapped():
             self.update_chip.pack(fill="x", pady=(0, ui.PAD_S))
@@ -979,6 +1021,16 @@ class App(ui.Resilient, tk.Tk):
         self.settings["check_updates"] = on
         save_settings(self.settings)
         if on:
+            self._check_updates(manual=True)
+
+    def _toggle_beta(self):
+        on = bool(self.beta_on.get())
+        self.settings["beta_updates"] = on
+        save_settings(self.settings)
+        if on:
+            self.toast("Beta versions will be offered too. They're tested, "
+                       "but newer — turn this off to stay on full "
+                       "releases.")
             self._check_updates(manual=True)
 
     # --------------------------------------------------------------- dialogs
@@ -1034,8 +1086,20 @@ class App(ui.Resilient, tk.Tk):
         top.bind("<Return>", lambda _e: done(True))
         self._present_dialog(top)
         primary.focus_set()
-        self.wait_window(top)
+        self._modals = getattr(self, "_modals", 0) + 1
+        try:
+            self.wait_window(top)
+        finally:
+            self._modals -= 1
         return out["ok"]
+
+    def _say_when_free(self, *args, **kw):
+        """Show a notice once no other dialog is open. Two start-up notices
+        used to open on top of each other."""
+        if getattr(self, "_modals", 0):
+            self.after(400, lambda: self._say_when_free(*args, **kw))
+            return
+        self._say(*args, **kw)
 
     def _say(self, title, message, kind="info", link=None):
         """Styled stand-in for the old messagebox.showinfo."""
@@ -1122,6 +1186,14 @@ class App(ui.Resilient, tk.Tk):
                            variable=self.updates_on,
                            onvalue=True, offvalue=False,
                            command=self._toggle_update_checks)
+        # Opt-in: pre-releases are for people happy to try things first.
+        # Off, only full releases are ever offered, exactly as before.
+        self.beta_on = tk.BooleanVar(
+            value=bool(self.settings.get("beta_updates", False)))
+        sm.add_checkbutton(label="Get beta versions too",
+                           variable=self.beta_on,
+                           onvalue=True, offvalue=False,
+                           command=self._toggle_beta)
         bar.add_cascade(label="Settings", menu=sm)
         hm = tk.Menu(bar, tearoff=0, **mk)
         hm.add_command(label="About Kestrel Wallet", command=self._about)
@@ -1539,7 +1611,9 @@ class App(ui.Resilient, tk.Tk):
             rowf.configure(bg=DUSK2 if on else RAIL)
 
     def _page(self, f, title, subtitle=""):
-        p = tk.Frame(f, bg=DUSK)
+        page = ui.ScrollPage(f, bg=DUSK)
+        page.pack(fill="both", expand=True)
+        p = tk.Frame(page.inner, bg=DUSK)
         p.pack(fill="both", expand=True, padx=ui.PAD_XL, pady=ui.PAD_L + 2)
         head = tk.Frame(p, bg=DUSK); head.pack(fill="x")
         tk.Label(head, text=title, bg=DUSK, fg=BUFF,
@@ -2115,17 +2189,14 @@ class App(ui.Resilient, tk.Tk):
 
     def _load_book(self):
         try:
-            with open(BOOK_FILE) as fh:
-                return dict(json.load(fh))
+            with open(BOOK_FILE, encoding="utf-8") as fh:
+                book = dict(json.load(fh))
+            return {str(k): str(v) for k, v in book.items()}
         except Exception:
             return {}
 
     def _save_book(self):
-        try:
-            with open(BOOK_FILE, "w") as fh:
-                json.dump(self.book, fh, indent=2)
-        except Exception:
-            pass
+        _write_json_atomic(BOOK_FILE, self.book)
 
     def _paint_book(self):
         if not hasattr(self, "book_tv"):
@@ -2229,6 +2300,9 @@ class App(ui.Resilient, tk.Tk):
             self._update_done()
         elif kind == "upfail":
             self._update_failed(*rest)
+        elif kind == "sentlog":
+            self._sent_log.append(tuple(rest))
+            del self._sent_log[:-50]
         elif kind == "sent":
             self.to_e.delete(0, "end"); self.amt_e.delete(0, "end")
             self.label_e.delete(0, "end")
@@ -2650,6 +2724,20 @@ class App(ui.Resilient, tk.Tk):
                      fg=BUFF if k != "Send" else GREEN,
                      font=MONO if k != "Send" else MONO_11B,
                      justify="left").grid(row=i, column=1, sticky="w", pady=3)
+        twin = self._same_payment_pending(to, amount, fee)
+        if twin is not None:
+            # The commonest way to pay twice: the first payment is sitting
+            # unconfirmed, it doesn't look like anything happened, and the
+            # person presses Send again.
+            age, same_to = twin
+            what = ("this amount to this address" if same_to
+                    else "exactly this amount")
+            tk.Label(top, text=f"⚠ A payment of {what} is already on its "
+                               f"way (sent {ui.fmt_age(age)} ago). If it "
+                               f"is the same payment, sending again pays "
+                               f"twice.",
+                     bg=DUSK2, fg=RED, font=SANS_9, wraplength=420,
+                     justify="left").pack(padx=20, pady=(0, 6))
         tk.Label(top, text="Payments cannot be reversed.",
                  bg=DUSK2, fg=AMBER, font=SANS_9).pack()
         row = tk.Frame(top, bg=DUSK2)
@@ -2666,6 +2754,27 @@ class App(ui.Resilient, tk.Tk):
         self._present_dialog(top)
         top.wait_window()
         return out["ok"]
+
+    def _same_payment_pending(self, to, amount, fee):
+        """(seconds since it was sent, known to be to this same address)
+        for an identical outgoing payment still unconfirmed, else None."""
+        total = amount + fee
+        mine = {r[0]: r for r in self._sent_log}
+        for p in self._pending:
+            if not p.get("outgoing") or p.get("delta") != -total:
+                continue
+            r = mine.get(p.get("txid"))
+            if r is not None and r[1] != to:
+                continue        # same amount, but we know it went elsewhere
+            return (p.get("age_seconds") or 0), r is not None
+        # Sent from here since the pending list was last loaded — or sent
+        # with no answer from the node — so not in that list yet.
+        now = time.time()
+        for txid, rto, rtotal, when in reversed(self._sent_log):
+            if rto == to and rtotal == total and when >= self._last_ok \
+                    and now - when < self._ttl:
+                return now - when, True
+        return None
 
     def send(self):
         if not self.wallet:
@@ -2694,9 +2803,10 @@ class App(ui.Resilient, tk.Tk):
                               f"{url}/utxos/{self.wallet.address}",
                               timeout=8)["utxos"]
             tx = self.wallet.build_transaction(utxos, to, amount, fee)
+            record = ("sentlog", tx.txid, to, amount + fee, time.time())
             try:
                 http_json("POST", url + "/tx", {"tx": tx.to_dict()},
-                          timeout=10)
+                          timeout=15)
             except urllib.error.HTTPError as e:
                 # surface the node's real reason ("fee below minimum…"),
                 # not a bare "HTTP Error 400"
@@ -2705,6 +2815,26 @@ class App(ui.Resilient, tk.Tk):
                 except Exception:
                     detail = str(e)
                 raise ValidationError(detail) from None
+            except (OSError, ValueError) as e:
+                if isinstance(getattr(e, "reason", e), ConnectionRefusedError):
+                    # nothing was listening, so nothing was sent
+                    raise ValidationError(
+                        "the node isn't running (connection refused). "
+                        "Nothing was sent.") from None
+                # The request may have got there even though the answer
+                # didn't come back. Calling that a failure invited a second
+                # press of Send — which, with the first payment's coins now
+                # committed, went out with different coins and paid twice.
+                if not self._node_has(url, tx.txid):
+                    self.q.put(record)
+                    msg = (f"Not confirmed yet — the node didn't answer "
+                           f"({type(e).__name__}). The payment may still "
+                           f"have gone through: check Transactions in a "
+                           f"minute before sending again.")
+                    self.q.put(("note", msg, AMBER))
+                    self.q.put(("toast", msg, "warn"))
+                    return
+            self.q.put(record)
             self.q.put(("note",
                         f"✓ Sent {format_ksl(amount)}. The next block "
                         "confirms it — about 2 minutes.", GREEN))
@@ -2721,6 +2851,23 @@ class App(ui.Resilient, tk.Tk):
         finally:
             self.q.put(("senddone",))
 
+    @staticmethod
+    def _node_has(url, txid, tries=3):
+        """Does the node know this transaction (pending or mined)?"""
+        for i in range(tries):
+            try:
+                t = http_json("GET", f"{url}/tx/{txid}", timeout=8)
+                if isinstance(t, dict) and t.get("txid") == txid:
+                    return True
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    return False
+            except Exception:
+                pass
+            if i + 1 < tries:
+                time.sleep(1.5 * (i + 1))
+        return False
+
     def _quit(self):
         try:
             self.settings["geometry"] = self.geometry()
@@ -2735,5 +2882,24 @@ class App(ui.Resilient, tk.Tk):
         self.destroy()
 
 
+def main():
+    try:
+        app = App()
+    except tk.TclError as e:
+        # No display: started over SSH, from a service, or on a desktop
+        # that isn't running yet. Say so plainly instead of a traceback.
+        msg = (f"Kestrel Wallet could not open its window ({e}). It needs a "
+               f"desktop session; to run a node without one, use "
+               f"kestrel-core: python -m kestrel.cli node")
+        logfile.setup(_HERE, "startup", quiet=True)
+        logfile.write(msg, level="error", to_console=False)
+        try:
+            print(msg, file=sys.stderr)
+        except Exception:
+            pass
+        sys.exit(1)
+    app.mainloop()
+
+
 if __name__ == "__main__":
-    App().mainloop()
+    main()

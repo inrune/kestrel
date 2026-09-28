@@ -310,12 +310,13 @@ async function loadBlocks(){
 async function loadPeers(){
   try{
     const d=await api("/peers"); const alive=new Set(d.alive||[]);
-    const list=(d.peers||[]);
+    const list=(d.peers||[]); const info=d.info||{};
     $("#peern").textContent=list.length?commas(list.length):"";
     $("#peers").innerHTML=list.length? list.map(u=>{
-      const on=alive.has(u);
+      const on=alive.has(u); const i=info[u]||{};
+      const sw=(i.software||"").replace(/^kestrel\//,"v");
       return `<div class="peer"><span class="dot ${on?"live":"bad"}"></span><span class="u">${esc(u.replace(/^https?:\/\//,""))}</span>`+
-             `<span class="faint">${on?"alive":"—"}</span></div>`;
+             `<span class="faint">${on?(sw?esc(sw):"alive"):"—"}</span></div>`;
     }).join("") : `<div class="empty">No peers yet — discovery in progress</div>`;
   }catch(e){ $("#peers").innerHTML=`<div class="empty">—</div>`; }
 }

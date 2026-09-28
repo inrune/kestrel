@@ -114,7 +114,7 @@ if !RC! neq 0 (
 
 echo.
 echo   Python installed. Starting %APP% ...
-echo   (If it does not open, close this window and run this file again —
+echo   (If it does not open, close this window and run this file again -
 echo    Windows sometimes needs a moment to notice the new PATH.^)
 timeout /t 3 >nul
 start "" "%~f0"

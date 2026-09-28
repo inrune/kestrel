@@ -25,6 +25,9 @@ _LOCK = threading.Lock()
 _PATH = None
 _QUIET = False                     # True in the GUI apps: console off
 MAX_BYTES = 1_000_000              # ~a few thousand lines, then rotate once
+CHECK_EVERY = 200                  # writes between size checks
+_WRITES = 0
+_DAY = None                        # date of the last line, for day markers
 
 
 def setup(directory: str, name: str = "kestrel", *, quiet: bool = True):
@@ -104,13 +107,28 @@ def _rotate(path):
 
 
 def write(line: str, *, level: str = "info", to_console: bool = True):
-    """One line to the log file. Never raises, never blocks for long."""
+    """One line to the log file. Never raises, never blocks for long.
+
+    The file used to be rotated only when an app started. A node on a
+    server runs for months without restarting, and its log simply grew
+    until the disk was full; it is now checked every few hundred lines.
+    Lines carry the time only, so a date line is written whenever the
+    day changes.
+    """
+    global _WRITES, _DAY
     stamp = time.strftime("%H:%M:%S")
     text = f"{stamp} {line}"
     if _PATH:
         try:
             with _LOCK:
+                _WRITES += 1
+                if _WRITES % CHECK_EVERY == 0:
+                    _rotate(_PATH)
+                today = time.strftime("%Y-%m-%d")
                 with open(_PATH, "a", encoding="utf-8", errors="replace") as f:
+                    if today != _DAY:
+                        _DAY = today
+                        f.write(f"--- {today} ---\n")
                     f.write(text + "\n")
         except Exception:
             pass
