@@ -52,6 +52,16 @@ node[0-9]*/
 kestrel-core.zip
 kestrel-miner.zip
 kestrel-wallet.zip
+SHA256SUMS.txt
+
+# --- Wallet temp files and the copies set aside before any replacement.
+#     These hold private keys exactly like the wallet itself.
+kestrel-wallet.json.*
+**/kestrel-wallet.json.*
+
+# --- Chain store scratch and set-aside files
+*.tmp
+blocks.rejected.jsonl
 
 # --- Python
 __pycache__/
