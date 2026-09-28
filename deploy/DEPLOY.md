@@ -196,7 +196,8 @@ best resilience upgrade: repeat Step 2 on another VPS and add its IP to
 ## Operating the node
 
 ```bash
-sudo systemctl status kestrel-node     # health
+sudo systemctl status kestrel-node     # is the service up?
+curl -s http://127.0.0.1:4444/health    # is the NODE healthy? (JSON; HTTP 503 if not)
 sudo journalctl -u kestrel-node -f      # live logs (Ctrl‑C to exit)
 sudo systemctl restart kestrel-node     # restart
 sudo systemctl stop kestrel-node        # stop (won't restart until 'start')
@@ -212,6 +213,14 @@ sudo bash deploy/setup-vps.sh           # re-syncs code, keeps your ledger
 
 The installer preserves `/opt/kestrel/kestrel-core/kestrel-data`, so the
 chain isn't re‑downloaded.
+
+**Monitoring.** `GET /health` answers `{"ok": true, "status": "synced", …}`
+with HTTP 200 while the node has peers and is level with them, and HTTP
+503 otherwise (`"no peers"`, `"syncing"`). Point any uptime checker
+(UptimeRobot, Healthchecks, a cron job with `curl -fsS`) at
+`http://YOUR_IP:4444/health` and you'll hear when the anchor goes deaf.
+Since v1.4.9 the node also writes a rotated `kestrel-log.txt` into its
+data directory, next to the chain.
 
 ---
 

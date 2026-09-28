@@ -114,7 +114,7 @@ DATA_DIR="$PREFIX/kestrel-core/kestrel-data"
 cat > /etc/systemd/system/kestrel-node.service <<UNIT
 [Unit]
 Description=Kestrel (KSL) anchor node
-Documentation=https://github.com/  (your repo)
+Documentation=https://github.com/inrune/kestrel
 After=network-online.target
 Wants=network-online.target
 
@@ -167,8 +167,8 @@ else
   echo "  (node did not report active yet — see logs below)"
 fi
 
-# quick local health check
-HEALTH="$(curl -fsS --max-time 4 "http://127.0.0.1:${PORT}/info" 2>/dev/null || true)"
+# quick local health check (503 is normal for a moment: no peers yet)
+HEALTH="$(curl -sS --max-time 4 "http://127.0.0.1:${PORT}/health" 2>/dev/null || true)"
 
 cat <<DONE
 
