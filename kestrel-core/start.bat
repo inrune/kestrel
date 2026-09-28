@@ -3,7 +3,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 title Kestrel Core
 
-rem  Kestrel Core — the node, on the command line. Unlike the desktop
+rem  Kestrel Core - the node, on the command line. Unlike the desktop
 rem  apps this one WANTS a console: its output is the point. It still
 rem  checks Python properly and offers to install it.
 

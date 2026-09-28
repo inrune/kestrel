@@ -234,9 +234,11 @@ class DhtRendezvous:
     def _save_cached_nodes(self, nodes):
         if not self._cache_path:
             return
+        tmp = self._cache_path + ".tmp"
         try:
-            with open(self._cache_path, "w") as fh:
+            with open(tmp, "w") as fh:
                 json.dump(nodes[:CACHE_NODES], fh)
+            os.replace(tmp, self._cache_path)
         except Exception:
             pass
 
@@ -246,18 +248,26 @@ class DhtRendezvous:
         tid = os.urandom(2)
         msg = {b"t": tid, b"y": b"q", b"q": q.encode(),
                b"a": {b"id": self.node_id, **args}}
+        # One overall deadline, not one per packet: a stream of stray or
+        # hostile datagrams used to keep this waiting indefinitely, each
+        # one resetting the socket timeout.
+        deadline = time.time() + QUERY_TIMEOUT * 2
         try:
             sock.sendto(bencode(msg), addr)
-            while True:
+            while time.time() < deadline:
                 data, src = sock.recvfrom(2048)
                 try:
                     r = bdecode(data)
                 except Exception:
                     continue
+                if not isinstance(r, dict):
+                    continue          # valid bencode, but not a KRPC message
                 if r.get(b"t") == tid and r.get(b"y") == b"r":
-                    return r.get(b"r", {})
+                    reply = r.get(b"r", {})
+                    return reply if isinstance(reply, dict) else None
                 if r.get(b"t") == tid:      # error or unexpected
                     return None
+            return None
         except OSError:
             return None
 
@@ -290,11 +300,14 @@ class DhtRendezvous:
                                 {b"info_hash": INFO_HASH})
                 if not r:
                     continue
-                peers |= _compact_to_peers(r.get(b"values"))
+                values = r.get(b"values")
+                peers |= _compact_to_peers(values if isinstance(values, list)
+                                           else None)
                 token = r.get(b"token")
                 if isinstance(token, bytes) and token:
                     nid = r.get(b"id", b"")
-                    d = (int.from_bytes(nid, "big") ^ target) if len(nid) == 20 else dist
+                    d = (int.from_bytes(nid, "big") ^ target) \
+                        if isinstance(nid, bytes) and len(nid) == 20 else dist
                     tokens.append((d, (ip, port), token))
                 for nid, nip, nport in _compact_to_nodes(r.get(b"nodes")):
                     if (nip, nport) not in queried:

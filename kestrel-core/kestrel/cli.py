@@ -70,9 +70,10 @@ def local_node() -> str | None:
 
 
 def main(argv=None):
-    # on the command line the console IS the log; keep it talking
-    logfile.setup(os.getcwd(), "cli", quiet=False)
+    from . import __version__
     p = argparse.ArgumentParser(prog="kestrel", description="Kestrel (KSL) node & wallet")
+    p.add_argument("--version", action="version",
+                   version=f"kestrel {__version__}")
     p.add_argument("--data-dir", default=None, help="chain data directory")
     p.add_argument("--wallet", default=WALLET_FILE, help="wallet file path")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -112,6 +113,10 @@ def main(argv=None):
                     help="peer address, repeatable: --peer 1.2.3.4 or http://host:4444")
 
     args = p.parse_args(argv)
+    # On the command line the console IS the log; keep it talking. The file
+    # goes next to the chain when one is named — a server's working
+    # directory is often read-only (see deploy/), the data directory never.
+    logfile.setup(args.data_dir or os.getcwd(), "cli", quiet=False)
 
     if args.cmd == "wallet":
         if args.action == "new" and os.path.exists(args.wallet):
@@ -138,6 +143,10 @@ def main(argv=None):
                   f"of {s['max_supply_ksl']}")
             print(f"next reward: {s['next_reward_ksl']}")
             print(f"mempool    : {s['mempool']} tx")
+            print(f"peers      : {s.get('peers_alive', 0)} online of "
+                  f"{s.get('peer_count', 0)} known")
+            if s.get("software"):
+                print(f"software   : {s['software']}")
             return 0
         chain = Blockchain(data_dir=args.data_dir)
         tip = chain.tip
@@ -182,6 +191,11 @@ def main(argv=None):
         return 0
 
     if args.cmd == "send":
+        from .crypto_utils import is_valid_address
+        if not is_valid_address(args.to):
+            print(f"error: {args.to!r} is not a Kestrel address "
+                  f"(they start with K)")
+            return 1
         wallet = load_or_create_wallet(args.wallet)
         try:
             amount, fee = parse_ksl(args.amount), parse_ksl(args.fee)
@@ -202,7 +216,11 @@ def main(argv=None):
                 txid = chain.add_transaction(tx)
                 chain.save()
                 print(f"queued in local mempool: {txid}")
-                print("mine a block to confirm it:  python -m kestrel.cli mine")
+                print("No node is running on this machine, so this payment "
+                      "has NOT been sent to\nthe network yet. Start one "
+                      "(python -m kestrel.cli start) and it goes out\n"
+                      "automatically, or mine a block locally to confirm "
+                      "it:  python -m kestrel.cli mine")
         except ValidationError as e:
             print(f"error: {e}")
             return 1

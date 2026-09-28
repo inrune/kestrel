@@ -264,7 +264,10 @@ class LanDiscovery:
                 continue
             except OSError:
                 return
-            url, nid = self.parse_packet(data, ip, self.node_id)
+            try:
+                url, nid = self.parse_packet(data, ip, self.node_id)
+            except Exception:
+                continue          # never let one odd packet end the loop
             if url:
                 try:
                     self.on_peer(url, nid)
@@ -280,16 +283,20 @@ class LanDiscovery:
             return None, None
         try:
             msg = json.loads(data[len(PACKET_PREFIX):])
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
             return None, None
-        if msg.get("magic") != params.NETWORK_MAGIC:
+        # Anyone on the LAN can send anything to this port. A packet whose
+        # body was valid JSON but not an object — `[]`, `7`, `"x"` — used
+        # to raise AttributeError here, which escaped the listener loop
+        # and silently ended LAN discovery for the rest of the session.
+        if not isinstance(msg, dict) or \
+                msg.get("magic") != params.NETWORK_MAGIC:
             return None, None
-        nid = str(msg.get("id", ""))
+        nid = str(msg.get("id", ""))[:64]
         if not nid or nid == own_id:
             return None, None      # our own echo
-        try:
-            port = int(msg["port"])
-        except (KeyError, ValueError, TypeError):
+        port = msg.get("port")
+        if not isinstance(port, int) or isinstance(port, bool):
             return None, None
         if not (0 < port < 65536):
             return None, None

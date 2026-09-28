@@ -118,8 +118,12 @@ the wider internet, so peer lists stay clean and connectable.
   re-announced continuously, and dropped after repeated failures.
 - **Gossip** — new blocks and transactions push to all peers instantly;
   a background loop catches up anything missed (incremental sync — only
-  missing blocks are downloaded — with full re-validation on forks).
-  Mempools sync too, so a transaction sent anywhere reaches every miner.
+  missing blocks are downloaded, in pages). On a fork, only the blocks
+  after the fork point are validated: every node keeps undo data for the
+  last 10,000 blocks, so it can wind its coin set back to the fork
+  instead of replaying history from genesis. Mempools sync too, and each
+  node re-offers its pending transactions every ten minutes, so a
+  payment sent from behind a router still reaches every miner.
 
 ### Going public — the launch checklist
 
@@ -152,10 +156,11 @@ Every node speaks plain JSON over HTTP (CORS open):
 
 ```
 GET  /                    live dashboard (browser) · JSON welcome (API)
-GET  /info                node + chain summary
+GET  /info                node + chain summary (includes "software")
+GET  /health              monitoring probe — 200 when synced with peers, else 503
 GET  /supply              rich chain statistics
 GET  /latest?n=15         newest blocks
-GET  /chain?from=H        full blocks from height H
+GET  /chain?from=H&limit=N  full blocks from height H (all, or N of them)
 GET  /block/<height>      one block with transactions, fees, miner
 GET  /blockhash/<id>      block by id
 GET  /tx/<txid>           transaction with fee + confirmations
@@ -168,10 +173,15 @@ GET  /mempool             pending transactions (incl. raw, for relay)
 GET  /peers               known peers + liveness
 POST /tx                  submit a signed transaction   {"tx": {...}}
 POST /block               submit a mined block          {"block": {...}}
+POST /chain               push a heavier chain          {"blocks": [...], "from": H}
 POST /announce            p2p hello                     {"port", "id"}
 POST /peers/add           register a peer               {"url": "http://..."}
 POST /mine                mine n blocks (loopback only) {"address", "count", "threads"}
 ```
+
+Request bodies must be JSON objects; `NaN`/`Infinity` and absurd nesting
+are refused with a 400, and bodies over 4 MB (64 MB for `POST /chain`)
+with a 413.
 
 An explorer is a weekend project: `/latest` for the feed, `/search` to
 route queries, `/block`, `/tx` and `/address` for the pages. A wallet is
@@ -201,7 +211,13 @@ kestrel/blockchain.py     validation, UTXO set, retargeting, persistence
 kestrel/wallet.py         keys, coin selection, transaction building
 kestrel/miner.py          candidate assembly, multi-core proof-of-work
 kestrel/discovery.py      LAN auto-discovery + seed loading
+kestrel/rendezvous.py     worldwide discovery over the BitTorrent DHT
+kestrel/upnp.py           automatic port opening (UPnP / NAT-PMP)
 kestrel/node.py           HTTP p2p node + JSON API
+kestrel/updates.py        the apps' ask-first updater
+kestrel/announcements.py  the project's announcement feed (untrusted text)
+kestrel/logfile.py        kestrel-log.txt, rotated
+kestrel/ui.py             the desktop apps' shared look (needs tkinter)
 kestrel/dashboard.py      self-contained browser dashboard (served at /)
 kestrel/cli.py            command-line interface
 ../kestrel-miner, ../kestrel-wallet   the official desktop apps

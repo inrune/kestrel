@@ -15,7 +15,6 @@ by hand (progress, sparklines, dials) done properly on a canvas.
 Nothing here knows about blocks, coins or nodes — it is only the surface.
 """
 
-import sys
 import time
 import traceback
 import tkinter as tk
@@ -339,6 +338,143 @@ class Resilient:
         return self.every(ms, pump, where=where)
 
 
+# ========================================================= scroll page
+
+class ScrollPage(tk.Frame):
+    """A page that scrolls when its content is taller than the window.
+
+    When there is room, the content is stretched to the full height, so
+    tables and logs packed with expand=True still fill the space exactly
+    as before. When there isn't, a scrollbar appears instead of the
+    bottom of the page — and whatever was packed after it, such as the
+    status line — silently falling off the edge of the window.
+
+    Build into `.inner`.
+    """
+
+    _SCROLLS_ITSELF = ("Treeview", "Text", "Listbox", "Spinbox")
+
+    def __init__(self, parent, bg=SURFACE):
+        super().__init__(parent, bg=bg)
+        # small scroll units, so a trackpad's stream of tiny wheel events
+        # glides instead of throwing the page to the end
+        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0,
+                                yscrollincrement=8)
+        self.bar = ttk.Scrollbar(self, orient="vertical",
+                                 command=self.canvas.yview,
+                                 style="K.Vertical.TScrollbar")
+        self.canvas.configure(yscrollcommand=self.bar.set)
+        self.inner = tk.Frame(self.canvas, bg=bg)
+        self._win = self.canvas.create_window(0, 0, window=self.inner,
+                                              anchor="nw")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self._bar_on = False
+        self._last = None
+        self._spare = 0.0
+        try:
+            self._aqua = self.tk.call("tk", "windowingsystem") == "aqua"
+        except tk.TclError:
+            self._aqua = False
+        self.inner.bind("<Configure>", self._fit, add="+")
+        self.canvas.bind("<Configure>", self._fit, add="+")
+        self.bind("<Enter>", self._wheel_on, add="+")
+        self.bind("<Leave>", self._wheel_off, add="+")
+        self.bind("<Destroy>", self._gone, add="+")
+        self.after(400, self._watch)
+
+    def _watch(self):
+        """Refit when the content changes size on its own.
+
+        Once the page has been given a height, content that grows or
+        shrinks later (tiles folding onto two rows, a row shown or
+        hidden) only changes what it *asks* for, and that raises no
+        <Configure> — so without a look now and then the bottom of the
+        page could end up out of reach.
+        """
+        try:
+            if not self.winfo_exists():
+                return
+            if self.winfo_ismapped():
+                self._fit()
+            self.after(400, self._watch)
+        except tk.TclError:
+            pass
+
+    def _gone(self, e):
+        if e.widget is self:
+            self._wheel_off()
+
+    def _fit(self, _e=None):
+        cw = self.canvas.winfo_width()
+        ch = self.canvas.winfo_height()
+        if cw <= 1 or ch <= 1:
+            return
+        need = self.inner.winfo_reqheight()
+        h = max(need, ch)
+        if (cw, h, ch) != self._last:
+            self._last = (cw, h, ch)
+            self.canvas.itemconfigure(self._win, width=cw, height=h)
+            self.canvas.configure(scrollregion=(0, 0, cw, h))
+        show = need > ch + 2
+        if show != self._bar_on:
+            self._bar_on = show
+            if show:
+                self.bar.pack(side="right", fill="y", before=self.canvas)
+            else:
+                self.bar.pack_forget()
+                self.canvas.yview_moveto(0)
+
+    # -- mouse wheel: only while the pointer is over this page, and never
+    #    stealing it from a table or text box that scrolls on its own
+    def _wheel_on(self, _e=None):
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.bind_all(seq, self._wheel)
+
+    def _wheel_off(self, e=None):
+        # moving onto one of our own children is not leaving the page
+        if getattr(e, "detail", "") == "NotifyInferior":
+            return
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            try:
+                self.unbind_all(seq)
+            except tk.TclError:
+                pass
+
+    def _wheel(self, e):
+        try:
+            if not self._bar_on or not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        try:
+            if e.widget.winfo_class() in self._SCROLLS_ITSELF:
+                return
+        except Exception:
+            pass
+        # one notch of an ordinary wheel moves 5 units (40 px)
+        if getattr(e, "num", None) == 4:
+            units = -5.0
+        elif getattr(e, "num", None) == 5:
+            units = 5.0
+        else:
+            d = getattr(e, "delta", 0)
+            if not d:
+                return
+            if self._aqua:
+                units = -float(d)           # macOS: small deltas, many events
+            else:
+                units = -d * 5 / 120.0      # Windows: 120 a notch, less on a
+                                            # precision touchpad — add them up
+        self._spare += units
+        n = int(self._spare)
+        self._spare -= n
+        if n:
+            try:
+                self.canvas.yview_scroll(n, "units")
+            except tk.TclError:
+                pass
+
+
 # ============================================================== helpers
 
 def fmt_age(seconds: float) -> str:
@@ -351,6 +487,19 @@ def fmt_age(seconds: float) -> str:
     if s < 86400:
         return f"{s // 3600}h {(s % 3600) // 60}m"
     return f"{s // 86400}d {(s % 86400) // 3600}h"
+
+
+def ksl_compact(feathers: int) -> str:
+    """12.5 KSL, 1,234.00001 KSL, 0 KSL — exact, just without the
+    trailing zeros. For the stat tiles, where eight decimal places of
+    zeros pushed the last tile off the edge of the window."""
+    sign = "-" if feathers < 0 else ""
+    feathers = abs(int(feathers))
+    whole, frac = divmod(feathers, 100_000_000)
+    text = f"{whole:,}"
+    if frac:
+        text += "." + f"{frac:08d}".rstrip("0")
+    return f"{sign}{text} KSL"
 
 
 def mid_ellipsis(s: str, keep: int = 10) -> str:
@@ -868,6 +1017,7 @@ class Toasts:
     MARGIN = PAD_L
     GAP = PAD_S
     WIDTH = 330
+    MAX_SHOWN = 4           # beyond this the oldest makes way
 
     def __init__(self, root):
         self.root = root
@@ -937,7 +1087,23 @@ class Toasts:
             pass
 
     # -- showing -------------------------------------------------------
-    def show(self, text, kind="info", ms=4800):
+    def show(self, text, kind="info", ms=4800, key=None):
+        """Show a message. With `key`, a message still on screen under the
+        same key is updated in place instead of stacking another card on
+        top of it — ten blocks found in a minute is one card that counts,
+        not ten cards covering the window."""
+        if key is not None:
+            for t in list(self.items):
+                if getattr(t, "_kestrel_key", None) == key:
+                    try:
+                        t._kestrel_msg.configure(text=text)
+                        t._kestrel_deadline = max(t._kestrel_deadline,
+                                                  time.time() + ms / 1000.0)
+                        return t
+                    except Exception:
+                        break
+        while len(self.items) >= self.MAX_SHOWN:
+            self.close(self.items[0])
         accent, _ = LEVELS.get(kind, LEVELS["info"])
         host = self._ensure_host()
         if host is None:
@@ -966,6 +1132,8 @@ class Toasts:
 
         t._kestrel_deadline = time.time() + ms / 1000.0
         t._kestrel_held = False
+        t._kestrel_key = key
+        t._kestrel_msg = msg
 
         # Whether the pointer is over the card is one question, but Tk asks
         # it once per widget: moving from a frame onto its own child sends
