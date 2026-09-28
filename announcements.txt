@@ -1,3 +1,13 @@
+id: 2026-09-v149
+date: 2026-09-28
+level: important
+title: v1.4.9 is out — update when you can
+body: Fixes a bug where switching to a heavier chain could freeze the
+  node, and a rare case where the in-app updater could touch files it
+  shouldn't have. Also faster syncing, pending payments that no longer
+  get stranded behind a router, and an optional beta channel if you
+  want to try new versions early. Full notes on the releases page.
+link: https://github.com/inrune/kestrel/releases/tag/v1.4.9
 ---
 
 id: 2026-09-telegram-group
@@ -9,4 +19,3 @@ body: A Telegram group for people running Kestrel — a place to ask
   network. Not run by anyone claiming special access to your wallet:
   nobody there will ever ask for your key or your wallet file.
 link: https://t.me/+m72FpLnBhag0YzRk
- 
