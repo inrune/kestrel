@@ -27,9 +27,10 @@ Networking is zero-config, the way Bitcoin launched:
 
 JSON API
   GET  /info                 node + chain summary (p2p handshake)
+  GET  /health               one-line health check for monitors (200 / 503)
   GET  /supply               rich chain statistics
   GET  /latest[?n=15]        newest blocks (light view)
-  GET  /chain[?from=H]       full blocks from height H (default 0)
+  GET  /chain[?from=H&limit=N]  full blocks from height H (default 0)
   GET  /block/<height>       one block, enriched, with transactions
   GET  /blockhash/<id>       one block by block id
   GET  /tx/<txid>            a transaction (chain or mempool) with context
@@ -42,6 +43,7 @@ JSON API
   GET  /peers                known peer URLs + liveness
   POST /tx                   submit a signed transaction  {tx: {...}}
   POST /block                submit a mined block         {block: {...}}
+  POST /chain                push a heavier chain         {blocks, from}
   POST /announce             p2p hello: {port, id} — registers caller as peer
   POST /peers/add            register a peer              {url: "http://..."}
   POST /mine                 mine n blocks (loopback only){address, count}
@@ -53,14 +55,15 @@ import os
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import params
 from .block import Block
-from .blockchain import Blockchain, ValidationError, MEMPOOL_TTL
-from .transaction import Transaction, COINBASE_TXID
+from .blockchain import Blockchain, ValidationError, MEMPOOL_TTL, UNDO_DEPTH
+from .transaction import Transaction
 from .wallet import format_ksl
 from .miner import assemble_candidate, find_pow
 from . import upnp
@@ -68,7 +71,7 @@ from . import logfile
 from . import dashboard
 from .discovery import (LanDiscovery, load_seed_nodes, fetch_remote_seeds,
                         new_node_id, get_lan_ip, is_routable_url,
-                        is_routable_host, host_of, normalize_peer_url)
+                        is_routable_host, normalize_peer_url)
 from .rendezvous import DhtRendezvous
 
 SYNC_INTERVAL = int(os.environ.get("KESTREL_SYNC_INTERVAL", "15"))
@@ -84,10 +87,62 @@ ALONE_AFTER_ATTEMPTS = 4    # sync rounds with no answer before we accept
 REMAP_INTERVAL = 15 * 60    # re-ask the router for the port (renew/reboot)
 RECHECK_INTERVAL = 10 * 60  # re-test reachability (things change)
 SEED_REFRESH = 10 * 60      # re-fetch published seed lists while peerless
+REBROADCAST_INTERVAL = 10 * 60  # re-offer our pending transactions to peers
+REBROADCAST_MAX = 50            # ...at most this many per round
+FETCH_BATCH = 500           # blocks per request while catching up
+LOCK_SLICE = 250            # blocks validated per hold of the node lock
+MAX_CATCHUP_BATCHES = 1_000  # 500,000 blocks per sync pass, then yield
+
+# Hard limits on what a peer can make us read. The old client read whole
+# responses into memory with no limit and no deadline, so one hostile or
+# broken peer could exhaust memory, or drip a byte every few seconds and
+# hold a sync worker hostage indefinitely.
+SMALL_RESPONSE = 8 * 1024 * 1024          # /info, /mempool, handshakes
+CHAIN_RESPONSE = 512 * 1024 * 1024        # /chain
+RESPONSE_DEADLINE = 180                   # seconds for any one response
+MAX_BODY = 4 * params.MAX_BLOCK_SIZE      # request bodies in general
+MAX_CHAIN_BODY = 64 * 1024 * 1024         # POST /chain carries many blocks
+
+try:
+    from . import __version__ as SOFTWARE_VERSION
+except ImportError:                            # pragma: no cover
+    SOFTWARE_VERSION = "?"
+SOFTWARE = f"kestrel/{SOFTWARE_VERSION}"
 # (v1.4: connections that just work — loose addresses accepted everywhere,
 #  instant mutual handshake on manual add, parallel sync/announce loops,
 #  NAT-PMP + UPnP renewal, DHT node caching + fast retry while peerless,
 #  and peer-book hygiene so dead addresses can't crowd out live ones)
+
+
+# ------------------------------------------------------------ strict JSON
+
+def _no_constants(name):
+    raise ValueError(f"{name} is not valid JSON")
+
+
+def strict_loads(raw):
+    """json.loads for input from strangers.
+
+    Python's parser accepts NaN and Infinity, which are not JSON and which
+    blow up later as OverflowError deep inside a block parser — an
+    exception nothing was expecting. Nesting deep enough to exhaust the
+    stack is a RecursionError. Both come back here as a plain ValueError.
+    """
+    try:
+        return json.loads(raw, parse_constant=_no_constants)
+    except RecursionError:
+        raise ValueError("JSON nested too deeply") from None
+
+
+def _as_int(v, default=0) -> int:
+    """An integer from untrusted JSON, or `default`. Never a bool."""
+    if isinstance(v, bool):
+        return default
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str) and v.isascii() and v.isdigit() and len(v) < 200:
+        return int(v)       # isascii: "²".isdigit() is True, int("²") fails
+    return default
 
 
 class Node:
@@ -96,6 +151,7 @@ class Node:
         self.chain = chain
         self.host, self.port = host, port
         self.node_id = new_node_id()
+        self.started = time.time()
         self.on_log = None                # apps can hook this: fn(msg, level)
         self.public_ip = None             # learned from peers / the router
         self.upnp_mapped = False
@@ -108,12 +164,14 @@ class Node:
             u for u in (normalize_peer_url(p) for p in (peers or [])) if u)
         self.peers |= self.seeds
         self._peers_path = os.path.join(chain.data_dir, "peers.json")
+        self._peers_lock = threading.Lock()
         try:
-            with open(self._peers_path) as fh:
-                for p in json.load(fh):
-                    u = normalize_peer_url(str(p))
-                    if u and len(self.peers) < MAX_PEERS:
-                        self.peers.add(u)
+            with open(self._peers_path, encoding="utf-8") as fh:
+                saved = json.load(fh)
+            for p in saved if isinstance(saved, list) else []:
+                u = normalize_peer_url(str(p))
+                if u and len(self.peers) < MAX_PEERS:
+                    self.peers.add(u)
         except Exception:
             pass
         self.peers.discard(f"http://127.0.0.1:{port}")
@@ -123,6 +181,10 @@ class Node:
         self.peer_info: dict[str, dict] = {}   # url -> {alive,height,last,fails}
 
         self.lock = threading.RLock()
+        # one fork validation at a time: several peers offering the same
+        # heavier chain at once would otherwise validate it several times
+        # over, in parallel, for nothing
+        self._switching = threading.Lock()
         os.makedirs(chain.data_dir, exist_ok=True)
         self._save_peers()
         self._stop = threading.Event()
@@ -131,6 +193,7 @@ class Node:
         self._last_remap = 0.0        # when we last asked the router
         self._last_recheck = 0.0      # when we last tested reachability
         self._last_seedfetch = 0.0    # when we last pulled the seed lists
+        self._last_rebroadcast = time.time()
         self.discovery = LanDiscovery(self.port, self.node_id,
                                       on_peer=self._on_lan_peer)
         self.rendezvous = DhtRendezvous(
@@ -145,6 +208,8 @@ class Node:
         self._tx_index: dict[str, tuple] = {}     # txid -> (height, tx)
         self._block_index: dict[str, int] = {}    # block_id -> height
         self._addr_index: dict[str, list] = {}    # address -> [entries]
+        self._index_log: dict[int, tuple] = {}    # height -> what it added
+        self._rich = None                         # (chain version, ranking)
 
     # ------------------------------------------------------------------ log
 
@@ -166,11 +231,21 @@ class Node:
                        f"http://localhost:{self.port}")
 
     def _save_peers(self):
-        try:
-            with open(self._peers_path, "w") as fh:
-                json.dump(sorted(self.peers), fh)
-        except Exception:
-            pass
+        """Write the peer book. Many threads call this; one writes at a
+        time, and always to a temp file first — two writers on one open
+        file used to be able to leave it half one list and half another,
+        which then failed to load and cost the whole book."""
+        with self._peers_lock:
+            tmp = self._peers_path + ".tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(sorted(self.peers), fh)
+                os.replace(tmp, self._peers_path)
+            except Exception:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
 
     def _evict_dead_peer(self) -> bool:
         """Drop one known-dead, non-seed peer to make room for a fresh one.
@@ -196,7 +271,7 @@ class Node:
         Input is forgiving: '1.2.3.4', '1.2.3.4:4444' and full URLs all
         work — whatever shape people paste, it connects."""
         fresh = []
-        for u in urls:
+        for u in list(urls or [])[:200]:
             u = normalize_peer_url(str(u))
             if not u or self._is_self(u) or u in self.peers:
                 continue
@@ -215,7 +290,10 @@ class Node:
         127.0.0.1 URL from another network is unreachable here and would
         just create dead peers and 'unreachable' errors. LAN peers are
         found separately by UDP discovery, so nothing is lost."""
-        return self.add_peers([u for u in urls if is_routable_url(str(u))])
+        if not isinstance(urls, list):
+            return []
+        return self.add_peers([u for u in urls[:200]
+                               if isinstance(u, str) and is_routable_url(u)])
 
     def shareable_peers(self) -> list[str]:
         """The peers we advertise to others — only ones they could reach.
@@ -238,16 +316,24 @@ class Node:
             out = out + [mine]
         return sorted(set(out))
 
-    def _mark(self, url: str, ok: bool, height: int = None):
+    def _mark(self, url: str, ok: bool, height=None, *, work=None,
+              software=None):
         info = self.peer_info.setdefault(
             url, {"alive": False, "height": None, "last": 0, "fails": 0})
         if ok:
             info.update(alive=True, last=time.time(), fails=0,
                         ever_alive=True)
-            if height is not None:
-                info["height"] = height
-                if height > self.best_height:
-                    self.best_height = height
+            # Whatever a peer says about itself is a claim, and it ends up
+            # formatted in tables and compared with numbers. A height that
+            # is not a plain non-negative integer is simply not recorded.
+            h = _as_int(height, None)
+            if h is not None and h >= 0:
+                info["height"] = h
+                if work is not None:
+                    info["work"] = _as_int(work)
+            if isinstance(software, str):
+                info["software"] = "".join(
+                    ch for ch in software[:40] if ch.isprintable())
         else:
             info["fails"] += 1
             if info["fails"] >= 2:
@@ -295,15 +381,48 @@ class Node:
     # ------------------------------------------------------------- transport
 
     @staticmethod
+    def _read_capped(resp, max_bytes: int, deadline: float) -> bytes:
+        chunks, got = [], 0
+        while True:
+            if time.time() > deadline:
+                raise TimeoutError("peer took too long to answer")
+            # read1 returns whatever has arrived, so a peer dripping a byte
+            # at a time still hits the deadline; read(n) would wait for n.
+            reader = getattr(resp, "read1", None) or resp.read
+            chunk = reader(64 * 1024)
+            if not chunk:
+                break
+            got += len(chunk)
+            if got > max_bytes:
+                raise ValueError("response too large")
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    @staticmethod
     def _http_json(method: str, url: str, payload: dict = None,
-                   timeout: int = 10):
+                   timeout: int = 10, max_bytes: int = SMALL_RESPONSE):
         data = json.dumps(payload).encode() if payload is not None else None
         req = urllib.request.Request(
             url, data=data, method=method,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json",
+                     "User-Agent": SOFTWARE},
         )
+        deadline = time.time() + max(timeout, 1) + RESPONSE_DEADLINE
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read())
+            raw = Node._read_capped(resp, max_bytes, deadline)
+        return strict_loads(raw)
+
+    @classmethod
+    def _post_reply(cls, url: str, payload: dict, timeout: int = 60):
+        """POST and return (status, json-or-None) without raising on 4xx."""
+        try:
+            return 200, cls._http_json("POST", url, payload, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            try:
+                body = strict_loads(e.read(SMALL_RESPONSE))
+            except Exception:
+                body = None
+            return e.code, body if isinstance(body, dict) else None
 
     def broadcast(self, path: str, payload: dict):
         def push(peer):
@@ -343,26 +462,38 @@ class Node:
                 return
             if got.get("accepted") or got.get("reason") != "not on tip":
                 return
+            theirs = _as_int(got.get("total_work"))
+            their_height = _as_int(got.get("height"), -1)
             with self.lock:
-                ours = self.chain.total_work()
-                # Send the recent suffix rather than the entire chain, and
-                # tell them where it starts. Pushing every block from
-                # genesis meant this healing path switched itself off once
-                # the chain outgrew MAX_PUSH_BLOCKS, stranding exactly the
-                # NAT'd peers it exists to rescue.
-                start = max(1, self.chain.height - PUSH_WINDOW + 1)
-                blocks = [b.to_dict() for b in self.chain.blocks[start:]]
-            try:
-                theirs = int(got.get("total_work", 0))
-            except (TypeError, ValueError):
-                theirs = 0
+                ours, height = self.chain.total_work(), self.chain.height
             if theirs >= ours:
                 return          # they're heavier — sync_once will pull
-            try:
-                self._http_json("POST", peer + "/chain",
-                                {"blocks": blocks, "from": start}, timeout=60)
-            except Exception:
-                pass
+            # Send the recent suffix rather than the entire chain, and
+            # tell them where it starts. Pushing every block from genesis
+            # meant this healing path switched itself off once the chain
+            # outgrew MAX_PUSH_BLOCKS, stranding exactly the NAT'd peers it
+            # exists to rescue. A peer that is merely behind gets exactly
+            # what it is missing; one that forked deeper than the first
+            # push reaches gets a longer one, as far back as undo data
+            # goes on either side.
+            starts = []
+            if 0 <= their_height < height - PUSH_WINDOW:
+                # never more than a receiver accepts in one push
+                starts.append(max(their_height + 1,
+                                  height - MAX_PUSH_BLOCKS + 1))
+            for window in (PUSH_WINDOW, UNDO_DEPTH):
+                s = max(1, height - window + 1)
+                if not starts or s < starts[-1]:
+                    starts.append(s)
+            for start in starts:
+                with self.lock:
+                    picked = self.chain.blocks[start:]
+                blocks = [b.to_dict() for b in picked]   # outside the lock
+                _status, reply = self._post_reply(
+                    peer + "/chain", {"blocks": blocks, "from": start},
+                    timeout=120)
+                if not (reply and reply.get("reason") == "deeper"):
+                    return
 
         targets = self.alive_peers() or list(self.peers)
         for peer in targets:
@@ -376,10 +507,12 @@ class Node:
             got = self._http_json("POST", peer + "/announce",
                                   {"port": self.port, "id": self.node_id},
                                   timeout=5)
+            if not isinstance(got, dict):
+                return False
             if got.get("id") == self.node_id:
                 self._drop_self_peer(peer)
                 return False
-            me = str(got.get("your_ip", ""))
+            me = str(got.get("your_ip", ""))[:64]
             if me and is_routable_host(me):
                 self.public_ip = me       # how the world sees us
             self.add_network_peers(got.get("peers", []))
@@ -429,44 +562,24 @@ class Node:
         except Exception as e:
             self._mark(peer, False)
             raise ValidationError(f"unreachable ({e.__class__.__name__})")
-        if info.get("magic") != params.NETWORK_MAGIC:
+        if not isinstance(info, dict) or \
+                info.get("magic") != params.NETWORK_MAGIC:
             self._mark(peer, False)
             raise ValidationError("not a Kestrel node")
         if info.get("node_id") == self.node_id:
             self._drop_self_peer(peer)
             return "that address is this node itself"
         first_contact = not self.peer_info.get(peer, {}).get("alive")
-        self._mark(peer, True, info.get("height"))
+        their_work = _as_int(info.get("total_work"))
+        their_height = _as_int(info.get("height"), -1)
+        self._mark(peer, True, their_height, work=their_work,
+                   software=info.get("software"))
         self.add_network_peers(info.get("peers", []))
         if first_contact:   # make sure they know our address too
             threading.Thread(target=self.announce_to, args=(peer,),
                              daemon=True).start()
 
-        with self.lock:
-            our_work, our_height = self.chain.total_work(), self.chain.height
-        result = f"in sync at block {our_height:,}"
-        try:
-            their_work = int(info.get("total_work", 0))
-        except (TypeError, ValueError):
-            their_work = 0
-        if their_work > our_work:
-            # fast path: they are simply ahead — fetch only what we miss
-            data = self._http_json(
-                "GET", f"{peer}/chain?from={our_height + 1}", timeout=60)
-            with self.lock:
-                added = self.chain.extend_with(data.get("blocks", []))
-                if added:
-                    result = f"caught up to block {self.chain.height:,}"
-                    self._log(f"Downloaded {added} block(s) from {peer} — "
-                              f"now at block {self.chain.height:,}", "good")
-                else:
-                    # fork: re-validate their whole chain, adopt if heavier
-                    full = self._http_json("GET", peer + "/chain", timeout=120)
-                    if self.chain.maybe_replace(full.get("blocks", [])):
-                        result = (f"switched to the heavier chain "
-                                  f"(block {self.chain.height:,})")
-                        self._log(f"Adopted heavier chain from {peer} "
-                                  f"(block {self.chain.height:,})", "good")
+        result = self._catch_up(peer, their_work, their_height)
 
         # Mempool sync: pick up pending transactions we don't have.
         # add_transaction refuses anything this node recently gave up on, so
@@ -475,15 +588,191 @@ class Node:
         # all on a network of more than one node.
         try:
             mp = self._http_json("GET", peer + "/mempool", timeout=10)
+            raw = mp.get("raw", []) if isinstance(mp, dict) else []
+            txs = []
+            for d in raw[:500] if isinstance(raw, list) else []:
+                try:
+                    txs.append(Transaction.from_dict(d))
+                except Exception:
+                    pass
             with self.lock:
-                for raw in mp.get("raw", [])[:500]:
+                for tx in txs:
                     try:
-                        self.chain.add_transaction(Transaction.from_dict(raw))
-                    except (ValidationError, KeyError, ValueError):
+                        self.chain.add_transaction(tx)
+                    except ValidationError:
                         pass
         except Exception:
             pass
         return result
+
+    def _catch_up(self, peer: str, their_work: int, their_height: int) -> str:
+        """Get level with a peer that has more work than us.
+
+        Downloads happen with the node lock released, and validation takes
+        it in short slices, so a node that is catching up — even from
+        genesis, even across a fork — keeps answering its wallet and keeps
+        mining. It used to hold the lock across the download *and* a full
+        re-verification of the whole chain.
+        """
+        with self.lock:
+            our_work, our_height = self.chain.total_work(), self.chain.height
+        if their_work <= our_work:
+            # a taller claim with no more work behind it (a lighter fork,
+            # or a made-up height) is not a chain we would ever follow, so
+            # it must not hold the UI at "downloading" or /health at 503
+            self._set_proven(peer, their_height <= our_height)
+            return f"in sync at block {our_height:,}"
+
+        # 1. usually they are simply ahead of us on the same branch
+        added_total = 0
+        for _ in range(MAX_CATCHUP_BATCHES):
+            if self._stop.is_set():
+                break
+            data = self._http_json(
+                "GET", f"{peer}/chain?from={our_height + 1}"
+                       f"&limit={FETCH_BATCH}",
+                timeout=60, max_bytes=CHAIN_RESPONSE)
+            blocks = data.get("blocks") if isinstance(data, dict) else None
+            if not isinstance(blocks, list) or not blocks:
+                break
+            added = self._extend(blocks)
+            added_total += added
+            with self.lock:
+                our_work, our_height = (self.chain.total_work(),
+                                        self.chain.height)
+            # an older peer ignores `limit` and sends everything at once
+            if not added or our_work >= their_work \
+                    or len(blocks) > FETCH_BATCH:
+                break
+        if added_total:
+            self._log(f"Downloaded {added_total:,} block(s) from {peer} — "
+                      f"now at block {our_height:,}", "good")
+        if our_work >= their_work:
+            self._set_proven(peer, their_height <= our_height)
+            return f"caught up to block {our_height:,}"
+
+        # 2. otherwise their chain forks off ours somewhere
+        took, status = self._fork_switch(peer, their_height)
+        with self.lock:
+            height = self.chain.height
+        if took:
+            self._set_proven(peer, True)
+            return f"switched to the heavier chain (block {height:,})"
+        if status != "busy":
+            # they claimed more work and could not back it up; don't let
+            # that claim keep the UI saying "downloading" forever
+            self._set_proven(peer, False)
+        if added_total:
+            return f"caught up to block {height:,}"
+        return f"in sync at block {height:,}"
+
+    def _set_proven(self, peer: str, ok: bool):
+        info = self.peer_info.get(peer)
+        if info is not None:
+            info["unproven"] = not ok
+
+    def _extend(self, blocks: list) -> int:
+        """Append blocks that build on our tip, a slice at a time."""
+        added = 0
+        for i in range(0, len(blocks), LOCK_SLICE):
+            with self.lock:
+                n = self.chain.extend_with(blocks[i:i + LOCK_SLICE])
+            added += n
+            if n == 0:
+                break
+        return added
+
+    def _fork_switch(self, peer: str, their_height: int):
+        """Fetch as much of a peer's chain as it takes to find where it
+        forks from ours, then try to switch to it."""
+        if not self._switching.acquire(blocking=False):
+            return False, "busy"
+        try:
+            with self.lock:
+                our_height = self.chain.height
+            base = min(our_height, max(their_height, 0))
+            status = "deeper"
+            for window in (PUSH_WINDOW, UNDO_DEPTH):
+                start = max(1, base - window + 1)
+                data = self._http_json("GET", f"{peer}/chain?from={start}",
+                                       timeout=120,
+                                       max_bytes=CHAIN_RESPONSE)
+                blocks = data.get("blocks") if isinstance(data, dict) \
+                    else None
+                took, status = self._try_switch(blocks, start, peer=peer,
+                                                locked=True)
+                if status != "deeper" or start == 1:
+                    return took, status
+            data = self._http_json("GET", f"{peer}/chain", timeout=300,
+                                   max_bytes=CHAIN_RESPONSE)
+            blocks = data.get("blocks") if isinstance(data, dict) else None
+            return self._try_switch(blocks, 0, peer=peer, locked=True)
+        finally:
+            self._switching.release()
+
+    def _try_switch(self, blocks, start: int, *, peer: str = None,
+                    locked: bool = False):
+        """Plan (cheap, locked), validate (expensive, unlocked), adopt
+        (cheap, locked). Returns (switched, status)."""
+        if not locked:
+            if not self._switching.acquire(blocking=False):
+                return False, "busy"
+        try:
+            blocks = self._worked_prefix(blocks, start)
+            with self.lock:
+                plan, status = self.chain.plan_switch(blocks, start)
+            if plan is None:
+                return False, status
+            try:
+                candidate = plan.build()
+            except ValidationError as e:
+                self._log(f"Refused a chain from {peer or 'a peer'}: {e}",
+                          "warn")
+                return False, "invalid"
+            with self.lock:
+                took = self.chain.adopt(candidate, plan)
+                height, tip = self.chain.height, self.chain.tip
+            if not took:
+                return False, "lighter"
+            self._log("Switched to a heavier chain"
+                      + (f" from {peer}" if peer else "")
+                      + f" — now at block {height:,}", "good")
+            self.broadcast("/block", {"block": tip.to_dict()})
+            return True, "switched"
+        finally:
+            if not locked:
+                self._switching.release()
+
+    def _worked_prefix(self, blocks, start):
+        """Their blocks, cut at the first new one whose proof-of-work does
+        not meet its own stated target.
+
+        Claimed work is read from the targets a peer writes into its
+        headers, so without this one tiny POST naming an absurd target
+        could make us rewind thousands of blocks under the lock, only for
+        validation to throw the result away. Checking the new blocks'
+        hashes first (outside the lock, and only the ones after the fork,
+        which validation would hash anyway) makes a claim cost real work.
+        """
+        if not isinstance(blocks, list) or not all(
+                isinstance(d, dict) for d in blocks):
+            return blocks                       # plan_switch says "bad"
+        try:
+            with self.lock:
+                fork, status = self.chain.find_fork(blocks, int(start))
+        except Exception:
+            return blocks
+        if status != "ok":
+            return blocks
+        first = fork - int(start)
+        for i in range(first, len(blocks)):
+            try:
+                ok = Block.from_dict(blocks[i]).has_valid_pow()
+            except Exception:
+                ok = False
+            if not ok:
+                return blocks[:i]
+        return blocks
 
     def _sync_quiet(self, peer: str):
         try:
@@ -559,8 +848,8 @@ class Node:
         The manual version of this was 'quit the app and delete your
         chain file', which is alarming, easy to get wrong, and sits one
         slip away from deleting the wallet next to it. This does the same
-        job safely: it asks every peer for its chain and adopts the
-        heaviest valid one, keeping our own if ours still wins.
+        job safely: it asks every peer where it stands and moves to the
+        heaviest valid chain on offer, keeping our own if ours still wins.
 
         Returns (changed, human-readable message).
         """
@@ -569,26 +858,29 @@ class Node:
             return False, ("No other nodes are reachable right now, so "
                            "there is nothing to rebuild from. Check your "
                            "internet connection and try again in a moment.")
-        before = self.chain.height
-        best = None
+        with self.lock:
+            before_tip, before = self.chain.tip.block_id, self.chain.height
+        offers = []
         for peer in peers:
             try:
-                data = self._http_json("GET", peer + "/chain", timeout=120)
-                blocks = data.get("blocks") or []
-                if blocks and (best is None or len(blocks) > len(best)):
-                    best = blocks
+                info = self._http_json("GET", peer + "/info", timeout=5)
+                if isinstance(info, dict) and \
+                        info.get("magic") == params.NETWORK_MAGIC:
+                    offers.append((_as_int(info.get("total_work")),
+                                   _as_int(info.get("height"), -1), peer))
             except Exception:
                 continue
-        if not best:
-            return False, ("Could not download a chain from any node. "
+        if not offers:
+            return False, ("Could not reach any node to rebuild from. "
                            "They may be busy — try again shortly.")
-        try:
-            with self.lock:
-                took = self.chain.maybe_replace(best)
-                after = self.chain.height
-        except ValidationError as e:
-            return False, f"The chain offered by the network was rejected: {e}"
-        if took:
+        for work, height, peer in sorted(offers, reverse=True):
+            try:
+                self._catch_up(peer, work, height)
+            except Exception:
+                continue
+        with self.lock:
+            after_tip, after = self.chain.tip.block_id, self.chain.height
+        if after_tip != before_tip:
             return True, (f"Rebuilt from the network — now on the shared "
                           f"chain at block {after:,} (was {before:,}).")
         return False, (f"Already on the best chain the network has "
@@ -626,6 +918,10 @@ class Node:
                     logfile.write(f"could not write the mempool to disk "
                                   f"({e})", level="warn")
 
+        if now - self._last_rebroadcast > REBROADCAST_INTERVAL:
+            self._last_rebroadcast = now
+            self._rebroadcast()
+
         if self.alive_peers():
             if (self.reachable is None
                     or now - self._last_recheck > RECHECK_INTERVAL):
@@ -638,6 +934,41 @@ class Node:
                 self._last_seedfetch = now
                 threading.Thread(target=self._refresh_seeds,
                                  daemon=True).start()
+
+    def _rebroadcast(self):
+        """Offer our pending transactions to our peers again.
+
+        Relaying a payment was a single fire-and-forget broadcast. A
+        wallet behind NAT whose one broadcast missed — the peer was
+        restarting, the connection blipped — held a payment nobody else
+        knew about, and nothing ever tried again; the other nodes could
+        not pull it because they cannot dial in. Peers that already have
+        a transaction just say so.
+        """
+        peers = self.alive_peers()
+        if not peers:
+            return
+        with self.lock:
+            pool = sorted(self.chain.mempool.items(),
+                          key=lambda kv: self.chain.mempool_seen.get(kv[0], 0))
+            payloads = [tx.to_dict() for _t, tx in pool[:REBROADCAST_MAX]]
+        if not payloads:
+            return
+
+        def push_all(peer):
+            for p in payloads:
+                if self._stop.is_set():
+                    return
+                try:
+                    self._http_json("POST", peer + "/tx", {"tx": p},
+                                    timeout=5)
+                except urllib.error.HTTPError:
+                    continue          # "already in mempool" and friends
+                except Exception:
+                    return            # the peer went away; next round
+        for peer in peers:
+            threading.Thread(target=push_all, args=(peer,),
+                             daemon=True).start()
 
     def _refresh_seeds(self):
         remote = fetch_remote_seeds(self.chain.data_dir)
@@ -671,10 +1002,23 @@ class Node:
         return f"http://{self.public_ip}:{self.port}" if self.public_ip else None
 
     def sync_status(self) -> tuple[int, int]:
-        """(our height, tallest height seen on the network)."""
+        """(our height, tallest height the network has shown it can back).
+
+        A peer's claimed height only counts while it has not failed to
+        deliver on its claimed work — otherwise one peer reporting a
+        height it cannot prove would keep every screen saying
+        "downloading" for as long as it stayed connected.
+        """
         with self.lock:
             h = self.chain.height
-        return h, max(self.best_height, h)
+        best = h
+        for info in list(self.peer_info.values()):
+            ph = info.get("height")
+            if info.get("alive") and not info.get("unproven") and \
+                    isinstance(ph, int) and ph > best:
+                best = ph
+        self.best_height = best
+        return h, best
 
     @staticmethod
     def _is_lan_ip(ip: str) -> bool:
@@ -689,7 +1033,8 @@ class Node:
         try:
             info = self._http_json("GET", f"http://{ip}:{port}/info",
                                    timeout=4)
-            return info.get("magic") == params.NETWORK_MAGIC
+            return isinstance(info, dict) and \
+                info.get("magic") == params.NETWORK_MAGIC
         except Exception:
             return False
 
@@ -725,7 +1070,9 @@ class Node:
                                       {"port": self.port}, timeout=8)
             except Exception:
                 continue
-            ip = str(got.get("your_ip", ""))
+            if not isinstance(got, dict):
+                continue
+            ip = str(got.get("your_ip", ""))[:64]
             if is_routable_host(ip):
                 self.public_ip = ip
             before = self.reachable
@@ -761,23 +1108,45 @@ class Node:
         if self.peers:
             self._log(f"Connecting to {len(self.peers)} known "
                       f"node(s)…")
-        for peer in list(self.peers):
-            self.announce_to(peer)
+        targets = list(self.peers)
+        if targets:
+            with ThreadPoolExecutor(
+                    max_workers=min(SYNC_WORKERS, len(targets))) as ex:
+                list(ex.map(self.announce_to, targets))
         self.sync_once()
         n = len(self.alive_peers())
         if n:
             self._log(f"Connected — {n} node(s) reachable, "
                       f"block {self.chain.height:,}", "good")
+            # anything that was waiting while we were offline goes out now
+            self._last_rebroadcast = time.time()
+            self._rebroadcast()
             self.check_reachability()
         else:
             self._log("No other nodes reached yet. Still searching the "
                       "worldwide directory and your network… (a brand-new "
                       "network needs at least one always-on, reachable node "
                       "for everyone to find — see the README.)")
+        self.warm_indexes()
 
     # -------------------------------------------------------- chain indexing
 
-    def _reindex(self):
+    def warm_indexes(self, step: int = 2000):
+        """Build the explorer indexes in the background, a slice at a time.
+
+        The first request that needed them used to build all of them in
+        one go, holding the node lock for as long as that took — seconds,
+        on a long chain, right after start-up, which is exactly when a
+        wallet is asking for its balance.
+        """
+        while not self._stop.is_set():
+            with self.lock:
+                done = self._reindex(limit=step)
+            if done:
+                return
+            time.sleep(0.01)
+
+    def _reindex(self, limit: int = None) -> bool:
         """Keep the txid / block-id / address lookups level with the chain.
 
         This used to rebuild all three from genesis whenever the height
@@ -785,45 +1154,105 @@ class Node:
         lock. On a young chain nobody notices; by a few hundred thousand
         blocks it is seconds of work every two minutes, and every wallet
         asking for its balance waits behind it. The chain almost always
-        just grew by a block or two, so index only what is new and fall
-        back to a full rebuild when the tip does not line up (a reorg).
+        just grew by a block or two, so index only what is new; after a
+        reorg, wind back to the fork and index the new branch, rather
+        than starting again from genesis.
+
+        With `limit`, index at most that many blocks and return whether
+        the indexes are now complete.
         """
         c = self.chain
-        if self._index_at == c.height and self._index_tip == c.tip.block_id \
-                and self._tx_index:
-            return
+        if self._index_at == c.height and self._index_tip is not None \
+                and self._index_tip == c.tip.block_id:
+            return True
 
-        start = 0
-        if (self._tx_index and 0 <= self._index_at <= c.height
-                and self._index_tip
-                and c.blocks[self._index_at].block_id == self._index_tip):
-            start = self._index_at + 1      # same branch, just longer
-        else:
-            self._tx_index, self._block_index, self._addr_index = {}, {}, {}
+        if self._index_at >= 0 and not self._still_on_branch():
+            if not self._rewind_index():
+                self._clear_index()
 
-        for b in c.blocks[start:]:
-            self._block_index[b.block_id] = b.height
+        start = self._index_at + 1
+        stop = c.height + 1 if limit is None else min(c.height + 1,
+                                                      start + limit)
+        chunk = c.blocks[start:stop]
+        for b in chunk:
+            bid = b.block_id
+            txids = []
+            self._block_index[bid] = b.height
             for tx in b.transactions:
-                self._tx_index[tx.txid] = (b.height, tx)
+                t = tx.txid
+                txids.append(t)
+                self._tx_index[t] = (b.height, tx)
+            self._index_log[b.height] = (bid, txids, [])
         # addresses in a second pass: an input's address can only be
         # resolved once the transaction that created it is in _tx_index
-        for b in c.blocks[start:]:
-            for tx in b.transactions:
+        for b in chunk:
+            touched = self._index_log[b.height][2]
+            for tx, t in zip(b.transactions, self._index_log[b.height][1]):
                 for addr, delta in self._deltas_of(tx).items():
                     self._addr_index.setdefault(addr, []).append(
-                        (b.height, tx.txid, delta, tx.is_coinbase,
-                         tx.timestamp))
-        self._index_at, self._index_tip = c.height, c.tip.block_id
+                        (b.height, t, delta, tx.is_coinbase, tx.timestamp))
+                    touched.append(addr)
+        if chunk:
+            self._index_at = chunk[-1].height
+            self._index_tip = self._index_log[self._index_at][0]
+            floor = self._index_at - UNDO_DEPTH
+            if len(self._index_log) > UNDO_DEPTH + 512:
+                for h in [h for h in self._index_log if h < floor]:
+                    del self._index_log[h]
+        return self._index_at == c.height
+
+    def _still_on_branch(self) -> bool:
+        c = self.chain
+        at = self._index_at
+        return at <= c.height and self._index_tip is not None and \
+            c.blocks[at].block_id == self._index_tip
+
+    def _clear_index(self):
+        self._tx_index, self._block_index, self._addr_index = {}, {}, {}
+        self._index_log = {}
+        self._index_at, self._index_tip = -1, None
+
+    def _rewind_index(self) -> bool:
+        """Undo index entries above the point where the chain changed."""
+        c = self.chain
+        h = min(self._index_at, c.height)
+        while h >= 0:
+            entry = self._index_log.get(h)
+            if entry is None:
+                return False               # older than we kept: rebuild
+            if c.blocks[h].block_id == entry[0]:
+                break
+            h -= 1
+        for k in range(self._index_at, h, -1):
+            entry = self._index_log.pop(k, None)
+            if entry is None:
+                return False
+            bid, txids, addrs = entry
+            self._block_index.pop(bid, None)
+            for t in txids:
+                hit = self._tx_index.get(t)
+                if hit and hit[0] == k:
+                    del self._tx_index[t]
+            for a in addrs:
+                lst = self._addr_index.get(a)
+                while lst and lst[-1][0] == k:
+                    lst.pop()
+                if lst is not None and not lst:
+                    del self._addr_index[a]
+        self._index_at = h
+        self._index_tip = self._index_log[h][0] if h >= 0 else None
+        return True
 
     def _deltas_of(self, tx: Transaction) -> dict:
         """How much this transaction moves for each address it touches."""
         deltas: dict[str, int] = {}
         for o in tx.outputs:
-            deltas[o.address] = deltas.get(o.address, 0) + o.amount
+            if type(o.address) is str:   # see Blockchain._apply
+                deltas[o.address] = deltas.get(o.address, 0) + o.amount
         if not tx.is_coinbase:
             for i in tx.inputs:
                 got = self._resolve_output(i.txid, i.vout)
-                if got:
+                if got and type(got[1]) is str:
                     amt, addr = got
                     deltas[addr] = deltas.get(addr, 0) - amt
         return {a: d for a, d in deltas.items() if d}
@@ -839,6 +1268,14 @@ class Node:
             return o.amount, o.address
         return None
 
+    def address_history(self, addr: str, limit: int = 50) -> list:
+        """Newest-first confirmed history for an address: (height, txid,
+        delta, coinbase, timestamp) tuples. Call with the lock held."""
+        self._reindex()
+        entries = self._addr_index.get(addr, ())
+        return list(reversed(entries[-limit:])) if limit else \
+            list(reversed(entries))
+
     # ------------------------------------------------------------ enrichment
 
     def _confirmations(self, height: int) -> int:
@@ -847,6 +1284,7 @@ class Node:
     def _tx_view(self, tx: Transaction, block_height=None) -> dict:
         c = self.chain
         confirmed = block_height is not None
+        txid = tx.txid
         outs = []
         for vout, o in enumerate(tx.outputs):
             outs.append({
@@ -856,7 +1294,7 @@ class Node:
                 "amount_ksl": format_ksl(o.amount),
                 # only meaningful once confirmed; a mempool tx's outputs
                 # aren't in the UTXO set yet but aren't "spent" either
-                "spent": confirmed and (tx.txid, vout) not in c.utxos,
+                "spent": confirmed and (txid, vout) not in c.utxos,
             })
         ins, amount_in, resolved = [], 0, True
         if tx.is_coinbase:
@@ -875,7 +1313,7 @@ class Node:
                     ins.append({"txid": i.txid, "vout": i.vout})
         amount_out = tx.total_output
         view = {
-            "txid": tx.txid,
+            "txid": txid,
             "is_coinbase": tx.is_coinbase,
             "timestamp": tx.timestamp,
             "size": tx.size(),
@@ -894,8 +1332,8 @@ class Node:
             view["status"] = "confirmed"
         else:
             view["status"] = "mempool"
-            age = c.mempool_age(tx.txid)
-            view["first_seen"] = c.mempool_seen.get(tx.txid)
+            age = c.mempool_age(txid)
+            view["first_seen"] = c.mempool_seen.get(txid)
             view["age_seconds"] = round(age, 1)
             view["expires_in"] = round(max(MEMPOOL_TTL - age, 0), 1)
         return view
@@ -935,17 +1373,22 @@ class Node:
 
     def _supply_stats(self) -> dict:
         c = self.chain
+        self._reindex()
         circ = c.circulating_supply()
-        tx_count = sum(len(b.transactions) for b in c.blocks)
+        # every txid in the chain is in the index exactly once, so its size
+        # is the transaction count — no walk over every block
+        tx_count = len(self._tx_index)
         # average interval over the most recent blocks
         recent = [b.timestamp for b in c.blocks[-21:]]
         avg = None
         if len(recent) >= 2:
             avg = round((recent[-1] - recent[0]) / (len(recent) - 1), 1)
         halving_at = ((c.height // params.HALVING_INTERVAL) + 1) * params.HALVING_INTERVAL
+        _h, best = self.sync_status()
         return {
             "network": "kestrel",
             "magic": params.NETWORK_MAGIC,
+            "software": SOFTWARE,
             "height": c.height,
             "tip": c.tip.block_id,
             "difficulty": c.difficulty_of(c.tip.target),
@@ -956,7 +1399,7 @@ class Node:
             "peers": sorted(self.peers),
             "peer_count": len(self.peers),
             "peers_alive": len(self.alive_peers()),
-            "sync_target": max(self.best_height, c.height),
+            "sync_target": best,
             "public_ip": self.public_ip,
             "public_url": self.public_url(),
             "upnp": self.upnp_mapped,
@@ -978,6 +1421,26 @@ class Node:
             "avg_block_time": avg,
         }
 
+    def health(self) -> dict:
+        """What a monitoring probe wants to know, in one small answer."""
+        h, best = self.sync_status()
+        alive = len(self.alive_peers())
+        behind = max(best - h, 0)
+        if not alive:
+            status = "looking for peers" if \
+                self.network_state() == "looking" else "no peers"
+        elif behind > 2:
+            status = "syncing"
+        else:
+            status = "synced"
+        with self.lock:
+            tip_age = max(time.time() - self.chain.tip.timestamp, 0)
+        return {"ok": status == "synced", "status": status,
+                "height": h, "best_height": best, "behind": behind,
+                "peers_alive": alive, "tip_age_seconds": round(tip_age),
+                "uptime_seconds": round(time.time() - self.started),
+                "software": SOFTWARE}
+
     def _address_view(self, addr: str, limit: int = 50) -> dict:
         """Everything a wallet needs about one address, in one request.
 
@@ -990,7 +1453,7 @@ class Node:
         from .crypto_utils import is_valid_address
         c = self.chain
         if not is_valid_address(addr):
-            return {"address": addr, "valid": False,
+            return {"address": addr[:100], "valid": False,
                     "error": "not a Kestrel address"}
         bal = c.balance(addr)
         utxos = c.utxos_for(addr, spendable_only=False)
@@ -1050,18 +1513,22 @@ class Node:
         }
 
     def _richlist(self, n: int = 20) -> list[dict]:
-        totals: dict[str, int] = {}
-        for u in self.chain.utxos.values():
-            totals[u.address] = totals.get(u.address, 0) + u.amount
-        ranked = sorted(totals.items(), key=lambda kv: -kv[1])[:n]
+        """The largest balances. Ranked once per block, not per request —
+        the dashboard asks every five seconds for every open tab."""
+        key = self.chain.version
+        if self._rich is None or self._rich[0] != key:
+            totals = self.chain.address_totals()
+            ranked = sorted(totals.items(), key=lambda kv: -kv[1])[:100]
+            self._rich = (key, ranked)
         circ = self.chain.circulating_supply() or 1
         return [{"address": a, "amount": v, "amount_ksl": format_ksl(v),
-                 "pct": round(v / circ * 100, 4)} for a, v in ranked]
+                 "pct": round(v / circ * 100, 4)}
+                for a, v in self._rich[1][:n]]
 
     def _search(self, q: str) -> dict:
-        q = q.strip()
+        q = q.strip()[:128]
         c = self.chain
-        if q.isdigit():
+        if q.isdigit() and q.isascii():
             h = int(q)
             if 0 <= h <= c.height:
                 return {"type": "height", "value": h}
@@ -1069,7 +1536,7 @@ class Node:
             ql = q.lower()
             if ql in self._block_index:
                 return {"type": "block", "value": ql}
-            if ql in self._tx_index:
+            if ql in self._tx_index or ql in c.mempool:
                 return {"type": "tx", "value": ql}
         from .crypto_utils import is_valid_address
         if is_valid_address(q):
@@ -1147,11 +1614,16 @@ class Node:
                         return default
             return default
 
+        class _TooLarge(Exception):
+            pass
+
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
             # drop idle/half-open connections so scanners and slow clients
             # on a public port can't tie up a thread forever
             timeout = 30
+            server_version = SOFTWARE
+            sys_version = ""
 
             def log_message(self, *args):
                 pass
@@ -1191,14 +1663,23 @@ class Node:
                 except OSError:
                     pass          # client hung up mid-response; not our problem
 
-            def _body(self) -> dict:
+            def _body(self, cap: int = MAX_BODY) -> dict:
                 try:
                     length = int(self.headers.get("Content-Length", 0))
                 except (TypeError, ValueError):
-                    length = 0
-                # cap the body: nothing legitimate exceeds a few blocks
-                length = max(0, min(length, 4 * params.MAX_BLOCK_SIZE))
-                return json.loads(self.rfile.read(length) or b"{}")
+                    length = -1
+                if length < 0:
+                    raise ValueError("bad Content-Length")
+                if length > cap:
+                    # Refused outright rather than truncated: a truncated
+                    # body is bad JSON, and the unread remainder would be
+                    # parsed as the next request on this connection.
+                    self.close_connection = True
+                    raise _TooLarge()
+                body = strict_loads(self.rfile.read(length) or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError("expected a JSON object")
+                return body
 
             def _client_ip(self) -> str:
                 ip = self.client_address[0]
@@ -1219,6 +1700,14 @@ class Node:
             def do_GET(self):
                 try:
                     self._route_get()
+                except Exception as e:
+                    # A bug in one endpoint answers that one request with
+                    # a 500 — not a dropped connection, and never a dead
+                    # handler thread.
+                    node._log(f"request handler error on GET "
+                              f"{self.path[:80]}: {type(e).__name__}: {e}",
+                              "bad")
+                    self._send({"error": "internal error"}, 500)
                 finally:
                     self._flush()
 
@@ -1234,44 +1723,68 @@ class Node:
                     return self._send({
                         "name": "kestrel",
                         "network": params.NETWORK_MAGIC,
+                        "software": SOFTWARE,
                         "message": "Kestrel node — plain JSON over HTTP, "
                                    "CORS open. Start with /info or /supply. "
                                    "Open this URL in a browser for the live "
                                    "dashboard. Explorers, wallets and apps "
                                    "are yours to build on these endpoints.",
                         "endpoints": [
-                            "/info", "/supply", "/latest?n=15",
-                            "/chain?from=H", "/block/<height>",
+                            "/info", "/health", "/supply", "/latest?n=15",
+                            "/chain?from=H&limit=N", "/block/<height>",
                             "/blockhash/<id>", "/tx/<txid>",
                             "/address/<addr>", "/balance/<addr>",
                             "/utxos/<addr>", "/richlist?n=20",
                             "/search/<q>", "/mempool", "/peers",
-                            "POST /tx", "POST /block", "POST /announce",
-                            "POST /checkreach", "POST /peers/add",
-                            "POST /mine (loopback)",
+                            "POST /tx", "POST /block", "POST /chain",
+                            "POST /announce", "POST /checkreach",
+                            "POST /peers/add", "POST /mine (loopback)",
                         ],
                     })
                 parts = [p for p in path.split("/") if p]
                 c = node.chain
+
+                if path == "/chain":
+                    # Copy the list under the lock (a pointer copy — fast)
+                    # and serialise outside it. Blocks never change once
+                    # they are in the chain, so the copy is safe to read,
+                    # and a peer downloading the whole ledger no longer
+                    # holds up everyone else while it is turned into JSON.
+                    start = qint(query, "from", 0, 0, 10**9)
+                    limit = qint(query, "limit", 0, 0, 10**9)
+                    with node.lock:
+                        snap = (c.blocks[start:start + limit] if limit
+                                else c.blocks[start:])
+                    body = b'{"blocks":[' + b",".join(
+                        json.dumps(b.to_dict(),
+                                   separators=(",", ":")).encode()
+                        for b in snap) + b"]}"
+                    return self._raw(body, "application/json")
+                if path == "/health":
+                    h = node.health()
+                    return self._send(h, 200 if h["ok"] else 503)
+
                 with node.lock:
-                    node._reindex()
                     if path == "/info":
+                        _h, best = node.sync_status()
+                        supply = c.circulating_supply()
                         return self._send({
                             "network": "kestrel",
                             "magic": params.NETWORK_MAGIC,
                             "version": params.PROTOCOL_VERSION,
+                            "software": SOFTWARE,
                             "node_id": node.node_id,
                             "port": node.port,
                             "height": c.height,
                             "tip": c.tip.block_id,
                             "difficulty": c.difficulty_of(c.tip.target),
                             "total_work": c.total_work(),
-                            "supply_feathers": c.circulating_supply(),
-                            "supply": format_ksl(c.circulating_supply()),
+                            "supply_feathers": supply,
+                            "supply": format_ksl(supply),
                             "max_supply": format_ksl(params.MAX_SUPPLY),
                             "next_reward": format_ksl(c.block_subsidy(c.height + 1)),
                             "mempool": len(c.mempool),
-                            "best_height": max(node.best_height, c.height),
+                            "best_height": best,
                             "public_ip": node.public_ip,
                             "reachable": node.reachable,
                             "peers": node.shareable_peers(),
@@ -1282,33 +1795,33 @@ class Node:
                         n = qint(query, "n", 15, 1, 100)
                         blocks = [node._block_view(b) for b in c.blocks[-n:][::-1]]
                         return self._send({"blocks": blocks, "height": c.height})
-                    if path == "/chain":
-                        start = qint(query, "from", 0, 0, 10**9)
-                        return self._send({
-                            "blocks": [b.to_dict() for b in c.blocks[start:]]
-                        })
                     if len(parts) == 2 and parts[0] == "block":
                         try:
                             h = int(parts[1])
                         except ValueError:
                             return self._send({"error": "bad height"}, 400)
                         if 0 <= h <= c.height:
+                            node._reindex()
                             return self._send(node._block_view(c.blocks[h], full=True))
                         return self._send({"error": "no such height"}, 404)
                     if len(parts) == 2 and parts[0] == "blockhash":
+                        node._reindex()
                         h = node._block_index.get(parts[1].lower())
                         if h is not None:
                             return self._send(node._block_view(c.blocks[h], full=True))
                         return self._send({"error": "no such block"}, 404)
                     if len(parts) == 2 and parts[0] == "tx":
-                        hit = node._tx_index.get(parts[1].lower())
+                        node._reindex()
+                        txid = parts[1].lower()
+                        hit = node._tx_index.get(txid)
                         if hit:
                             height, tx = hit
                             return self._send(node._tx_view(tx, height))
-                        if parts[1] in c.mempool:
-                            return self._send(node._tx_view(c.mempool[parts[1]]))
+                        if txid in c.mempool:
+                            return self._send(node._tx_view(c.mempool[txid]))
                         return self._send({"error": "no such transaction"}, 404)
                     if len(parts) == 2 and parts[0] == "address":
+                        node._reindex()
                         n = qint(query, "n", 50, 1, 500)
                         return self._send(node._address_view(parts[1], n))
                     if len(parts) == 2 and parts[0] == "balance":
@@ -1319,8 +1832,11 @@ class Node:
                         n = qint(query, "n", 20, 1, 100)
                         return self._send({"richlist": node._richlist(n)})
                     if len(parts) == 2 and parts[0] == "search":
-                        return self._send(node._search(parts[1]))
+                        node._reindex()
+                        from urllib.parse import unquote
+                        return self._send(node._search(unquote(parts[1])))
                     if path == "/mempool":
+                        node._reindex()
                         txs = [node._tx_view(t) for t in c.mempool.values()]
                         return self._send({
                             "txids": list(c.mempool),
@@ -1332,8 +1848,8 @@ class Node:
                         return self._send({
                             "peers": sorted(node.peers),
                             "alive": sorted(node.alive_peers()),
-                            "info": {u: {k: v for k, v in i.items()}
-                                     for u, i in node.peer_info.items()},
+                            "info": {u: dict(i)
+                                     for u, i in list(node.peer_info.items())},
                         })
                 self._send({"error": "not found"}, 404)
 
@@ -1341,14 +1857,22 @@ class Node:
             def do_POST(self):
                 try:
                     self._route_post()
+                except Exception as e:
+                    node._log(f"request handler error on POST "
+                              f"{self.path[:80]}: {type(e).__name__}: {e}",
+                              "bad")
+                    self._send({"error": "internal error"}, 500)
                 finally:
                     self._flush()
 
             def _route_post(self):
+                cap = MAX_CHAIN_BODY if self.path == "/chain" else MAX_BODY
                 try:
-                    body = self._body()
-                except json.JSONDecodeError:
-                    return self._send({"error": "bad json"}, 400)
+                    body = self._body(cap)
+                except _TooLarge:
+                    return self._send({"error": "request too large"}, 413)
+                except (ValueError, UnicodeDecodeError) as e:
+                    return self._send({"error": f"bad json: {e}"}, 400)
                 c = node.chain
                 try:
                     if self.path == "/tx":
@@ -1400,51 +1924,41 @@ class Node:
                         # otherwise pull-only, which silently fails when the
                         # heavier chain lives behind NAT: we can't fetch from
                         # them, so both sides mine on forever in parallel.
-                        # maybe_replace applies the same work gate and full
-                        # revalidation a pulled chain gets, so an attacker
-                        # gains nothing by pushing instead of serving.
+                        # The same work gate and full validation a pulled
+                        # chain gets apply here, so an attacker gains
+                        # nothing by pushing instead of serving — and the
+                        # validation runs with the node lock released.
                         blocks = body.get("blocks")
                         if not isinstance(blocks, list):
                             return self._send({"error": "blocks must be a list"},
                                               400)
                         if len(blocks) > MAX_PUSH_BLOCKS:
                             return self._send({"error": "too many blocks"}, 400)
-                        try:
-                            start = int(body.get("from", 0) or 0)
-                        except (TypeError, ValueError):
+                        start = _as_int(body.get("from", 0) or 0, -1)
+                        if start < 0:
                             return self._send({"error": "bad from"}, 400)
                         with node.lock:
-                            if start:
-                                # A suffix: rebuild the full candidate from
-                                # our own prefix. start must be a height we
-                                # actually hold, and never 0 — the genesis
-                                # block is not replaceable.
-                                if not 1 <= start <= c.height:
-                                    return self._send(
-                                        {"error": "from out of range",
-                                         "height": c.height}, 409)
-                                blocks = ([b.to_dict()
-                                           for b in c.blocks[:start]] + blocks)
-                            took = c.maybe_replace(blocks)
                             height = c.height
-                            tip = c.tip
-                        if took:
-                            node._log(f"Adopted a heavier chain from the "
-                                      f"network — now at block {height:,}",
-                                      "good")
-                            node.broadcast("/block", {"block": tip.to_dict()})
-                        return self._send({"accepted": took, "height": height})
+                        # `from` must be a height we hold (or the one just
+                        # past our tip), and never 0 — the genesis block is
+                        # not replaceable. 0 / absent means a whole chain.
+                        if start and not 1 <= start <= height + 1:
+                            return self._send(
+                                {"error": "from out of range",
+                                 "height": height}, 409)
+                        took, status = node._try_switch(blocks, start)
+                        with node.lock:
+                            height = c.height
+                        return self._send({"accepted": took, "height": height,
+                                           "reason": status})
 
                     if self.path == "/announce":
-                        nid = str(body.get("id", ""))
+                        nid = str(body.get("id", ""))[:64]
                         if nid and nid == node.node_id:
                             return self._send({"id": node.node_id,
                                                "your_ip": self._client_ip(),
                                                "peers": node.shareable_peers()})
-                        try:
-                            port = int(body["port"])
-                        except (KeyError, ValueError, TypeError):
-                            return self._send({"error": "bad port"}, 400)
+                        port = _as_int(body.get("port"), 0)
                         if not (0 < port < 65536):
                             return self._send({"error": "bad port"}, 400)
                         ip = self._client_ip()
@@ -1468,10 +1982,7 @@ class Node:
                     if self.path == "/checkreach":
                         # the caller wants to know if IT is reachable: try to
                         # connect back to caller_ip:port and report the result
-                        try:
-                            port = int(body["port"])
-                        except (KeyError, ValueError, TypeError):
-                            return self._send({"error": "bad port"}, 400)
+                        port = _as_int(body.get("port"), 0)
                         if not (0 < port < 65536):
                             return self._send({"error": "bad port"}, 400)
                         ip = self._client_ip()
@@ -1482,7 +1993,7 @@ class Node:
                     if self.path == "/peers/add":
                         # loose input welcome: "1.2.3.4", "1.2.3.4:4444"
                         # and full URLs all work
-                        url = normalize_peer_url(str(body.get("url", "")))
+                        url = normalize_peer_url(str(body.get("url", ""))[:300])
                         if url:
                             # the local operator may point us anywhere (their
                             # own LAN, a test node); strangers may only hand
@@ -1519,8 +2030,11 @@ class Node:
                         return self._send({"mined": mined, "height": c.height})
                 except ValidationError as e:
                     return self._send({"accepted": False, "error": str(e)}, 400)
-                except (KeyError, ValueError, TypeError, AttributeError) as e:
-                    return self._send({"error": f"bad request: {e}"}, 400)
+                except (KeyError, ValueError, TypeError, AttributeError,
+                        IndexError, OverflowError, RecursionError) as e:
+                    return self._send({"error": f"bad request: "
+                                                f"{type(e).__name__}: {e}"[:300]},
+                                      400)
                 self._send({"error": "not found"}, 404)
 
         class _QuietServer(ThreadingHTTPServer):
@@ -1555,9 +2069,9 @@ class Node:
             f"\nKestrel node listening on http://{self.host}:{self.port}  "
             f"(height {self.chain.height}, {len(self.peers)} known peers)")
         logfile.console(f"  Dashboard  {base}/   (open in a browser)")
-        logfile.console(f"  JSON API   {base}/info  ·  {base}/supply")
+        logfile.console(f"  JSON API   {base}/info  ·  {base}/health")
         logfile.write(f"node listening on {self.host}:{self.port} "
-                      f"(height {self.chain.height})")
+                      f"(height {self.chain.height}, {SOFTWARE})")
 
         # zero-config networking: LAN + worldwide discovery + seeds + loops
         self.discovery.start()

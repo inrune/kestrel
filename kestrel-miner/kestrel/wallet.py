@@ -36,7 +36,7 @@ class Wallet:
 
     @classmethod
     def load(cls, path: str) -> "Wallet":
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
         key = bytes.fromhex(data["private_key"])
         if len(key) != 32:
@@ -54,10 +54,13 @@ class Wallet:
         therefore leave either the old wallet or the new one, never a
         half-written file.
 
-        As a second safeguard, if a wallet for a *different* address is
-        already at this path, it is copied aside first rather than being
-        overwritten, so a bug elsewhere can never silently destroy
-        somebody's keys.
+        As a second safeguard, anything already at this path that is not
+        this very wallet is moved aside first rather than overwritten — a
+        wallet for a different address, and also a file that can't be read
+        at all. A damaged wallet file is not "nothing worth keeping": the
+        key is often still in it, recoverable by hand, and the old rule
+        replaced such a file outright the moment an app started and made a
+        new wallet in its place. Returns the path it was moved to, if any.
         """
         data = {
             "private_key": self.private_key.hex(),
@@ -67,19 +70,27 @@ class Wallet:
             "warning": "Anyone with this file can spend your KSL. Keep it secret.",
         }
 
+        backup = None
         if os.path.exists(path):
             try:
-                with open(path) as f:
+                with open(path, encoding="utf-8") as f:
                     existing = json.load(f)
-                if existing.get("address") and existing["address"] != self.address:
-                    backup = f"{path}.replaced-{int(time.time())}.bak"
-                    os.replace(path, backup)
-                    try:
-                        os.chmod(backup, 0o600)
-                    except OSError:
-                        pass
-            except (OSError, ValueError):
-                pass      # unreadable/corrupt: nothing worth preserving
+                same = (isinstance(existing, dict) and
+                        existing.get("private_key") == self.private_key.hex())
+            except (OSError, ValueError, RecursionError):
+                same = False
+            if not same:
+                stamp = int(time.time())
+                backup = f"{path}.replaced-{stamp}.bak"
+                n = 1
+                while os.path.exists(backup):         # never clobber a backup
+                    backup = f"{path}.replaced-{stamp}-{n}.bak"
+                    n += 1
+                os.replace(path, backup)
+                try:
+                    os.chmod(backup, 0o600)
+                except OSError:
+                    pass
 
         tmp = f"{path}.tmp"
         with open(tmp, "w") as f:
@@ -99,6 +110,7 @@ class Wallet:
                 os.close(dirfd)
         except OSError:
             pass
+        return backup
 
     # ----------------------------------------------------------- building
 
@@ -151,7 +163,13 @@ def parse_ksl(s: str) -> int:
         whole, frac = s, ""
     if not (whole or frac):
         raise ValueError("no amount given")
-    if (whole and not whole.isdigit()) or (frac and not frac.isdigit()):
+
+    def digits(part):
+        # str.isdigit() also says yes to "²" and "٣", which int() then
+        # either rejects with a baffling message or quietly accepts
+        return part.isascii() and part.isdigit()
+
+    if (whole and not digits(whole)) or (frac and not digits(frac)):
         raise ValueError(f"bad amount {s!r} — use digits like 12.5")
     if len(frac) > 8:
         raise ValueError("amounts have at most 8 decimal places "

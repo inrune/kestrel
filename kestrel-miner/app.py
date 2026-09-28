@@ -14,6 +14,7 @@ Requires Python 3.10+ with tkinter and the `ecdsa` package.
 """
 
 import collections
+import contextlib
 import errno
 import ipaddress
 import json
@@ -36,8 +37,7 @@ for cand in (_HERE, os.path.abspath(os.path.join(_HERE, "..", ".."))):
 
 from kestrel import (params, updates, announcements, ui,   # noqa: E402
                      __version__ as KVER)
-from kestrel.blockchain import (Blockchain, ValidationError,  # noqa: E402
-                                MEMPOOL_TTL)
+from kestrel.blockchain import Blockchain, ValidationError  # noqa: E402
 from kestrel.wallet import Wallet, format_ksl, parse_ksl    # noqa: E402
 from kestrel.crypto_utils import is_valid_address, private_to_wif  # noqa: E402
 from kestrel.miner import assemble_candidate, find_pow, default_threads  # noqa: E402
@@ -63,7 +63,6 @@ _enable_dpi()
 
 import tkinter as tk                                         # noqa: E402
 from tkinter import ttk, filedialog                          # noqa: E402
-from tkinter import font as tkfont                           # noqa: E402
 
 DATA_DIR = os.path.join(_HERE, "kestrel-data")
 WALLET_FILE = os.path.join(_HERE, "kestrel-wallet.json")
@@ -115,18 +114,28 @@ def _resolve_fonts(root, scale=1.0):
 
 def load_settings() -> dict:
     try:
-        with open(SETTINGS_FILE) as fh:
+        with open(SETTINGS_FILE, encoding="utf-8") as fh:
             return dict(json.load(fh))
     except Exception:
         return {}
 
 
 def save_settings(d: dict):
+    """Write the settings file whole or not at all. A crash halfway
+    through the old in-place write left an empty file — and with it the
+    remembered payout address, lifetime totals and window position."""
+    tmp = SETTINGS_FILE + ".tmp"
     try:
-        with open(SETTINGS_FILE, "w") as fh:
+        with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(d, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, SETTINGS_FILE)
     except Exception:
-        pass
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def port_free(p):
@@ -424,6 +433,15 @@ class App(ui.Resilient, tk.Tk):
         # Diagnostics go to kestrel-log.txt beside the app, and the
         # console stays clean — see kestrel/logfile.py.
         logfile.setup(_HERE, "miner", quiet=True)
+        # put right anything an older version's updater got wrong
+        try:
+            self._recovered = updates.after_update(_HERE)
+        except Exception as e:
+            self._recovered = []
+            logfile.exception("after update", e)
+        if self._recovered:
+            logfile.write("restored after update: "
+                          + ", ".join(self._recovered), level="warn")
         _resolve_fonts(self)
         self.title(f"Kestrel Miner {KVER}")
         self.configure(bg=DUSK)
@@ -443,6 +461,14 @@ class App(ui.Resilient, tk.Tk):
 
         self.q: "queue.Queue[tuple]" = queue.Queue()
         self.mining = threading.Event()
+        # Each press of Start gets its own run. Stop then Start in quick
+        # succession used to leave the first loop alive — it looked at the
+        # shared flag, saw it set again, and carried on — so two loops
+        # mined side by side on twice the threads, each reporting its own
+        # hash rate into the same chart.
+        self._run = None
+        self._wallet_cache = None     # (file stamp, Wallet) — see _w_wallet
+        self._painted_at = 0.0
         self.blocks_found = 0
         self.session_feathers = 0
         self.samples = collections.deque(maxlen=120)
@@ -464,6 +490,17 @@ class App(ui.Resilient, tk.Tk):
         self._ensure_address()
         self._refresh_stats()
         self._start_loops()
+        if self._recovered:
+            names = "\n".join("  • " + r for r in self._recovered[:12])
+            more = len(self._recovered) - 12
+            self.after(1800, lambda: self._say_when_free(
+                "Your files are back",
+                "The previous version's updater removed some files of yours "
+                "from this folder while installing. They have been put "
+                "back:\n\n" + names + (f"\n  …and {more} more" if more > 0
+                                        else "") +
+                "\n\nNothing else was changed, and future updates never "
+                "remove anything but the app's own code."))
         self.after(400, self.start_node)       # auto-run the node on launch
         if self.settings.get("autostart"):
             self.after(2500, self._autostart)
@@ -660,8 +697,20 @@ class App(ui.Resilient, tk.Tk):
         top.bind("<Return>", lambda _e: done(True))
         self._present_dialog(top)
         primary.focus_set()
-        self.wait_window(top)
+        self._modals = getattr(self, "_modals", 0) + 1
+        try:
+            self.wait_window(top)
+        finally:
+            self._modals -= 1
         return out["ok"]
+
+    def _say_when_free(self, *args, **kw):
+        """Show a notice once no other dialog is open. Two start-up notices
+        used to open on top of each other."""
+        if getattr(self, "_modals", 0):
+            self.after(400, lambda: self._say_when_free(*args, **kw))
+            return
+        self._say(*args, **kw)
 
     def _say(self, title, message, kind="info", link=None):
         """Styled stand-in for the old messagebox.showinfo."""
@@ -732,6 +781,14 @@ class App(ui.Resilient, tk.Tk):
                            variable=self.updates_on,
                            onvalue=True, offvalue=False,
                            command=self._toggle_update_checks)
+        # Opt-in: pre-releases are for people happy to try things first.
+        # Off, only full releases are ever offered, exactly as before.
+        self.beta_on = tk.BooleanVar(
+            value=bool(self.settings.get("beta_updates", False)))
+        sm.add_checkbutton(label="Get beta versions too",
+                           variable=self.beta_on,
+                           onvalue=True, offvalue=False,
+                           command=self._toggle_beta)
         bar.add_cascade(label="Settings", menu=sm)
         hm = tk.Menu(bar, tearoff=0, **mk)
         hm.add_command(label="About Kestrel Miner", command=self._about)
@@ -900,7 +957,9 @@ class App(ui.Resilient, tk.Tk):
         # deliberately not packed — shown only by _render_note
 
         sb = tk.Frame(self, bg=SPOT)
-        sb.pack(fill="x", side="bottom")
+        # before=body: packed after it, the status line was the first
+        # thing squeezed out when a page was taller than the window
+        sb.pack(fill="x", side="bottom", before=self.body_frame)
         self.status_var = tk.StringVar()
         self.updated_var = tk.StringVar(value="")
         rbtn = tk.Button(sb, text="⟳", command=self._tick_now, bg=SPOT,
@@ -939,7 +998,8 @@ class App(ui.Resilient, tk.Tk):
             self.toast("Checking for a newer version…")
 
         def run():
-            rel = updates.fetch_latest()
+            rel = updates.fetch_latest(
+                beta=bool(self.settings.get("beta_updates", False)))
             if rel and updates.is_newer(rel["version"]):
                 self.q.put(("update", rel, manual))
             elif manual:
@@ -950,10 +1010,13 @@ class App(ui.Resilient, tk.Tk):
     def _on_update_available(self, rel, manual=False):
         self._update_rel = rel
         self.update_msg.set(
-            f"Kestrel {rel['version']} is available — you're on {KVER}. "
-            f"Updating keeps you in step with the network.")
+            f"Kestrel {updates.label(rel)} is available — you're on {KVER}. "
+            + ("It's a beta: newer, and still being tried out."
+               if rel.get("prerelease") else
+               "Updating keeps you in step with the network."))
         if not self.update_bar.winfo_ismapped():
-            self.update_bar.pack(fill="x", side="bottom")
+            self.update_bar.pack(fill="x", side="bottom",
+                                 before=self.body_frame)
         if manual or self.settings.get("update_prompted") != rel["version"]:
             self.settings["update_prompted"] = rel["version"]
             save_settings(self.settings)
@@ -962,11 +1025,11 @@ class App(ui.Resilient, tk.Tk):
     def _update_dialog(self, rel):
         can, why = updates.can_install(_HERE)
         mining = self.mining.is_set()
-        top = self._dialog(f"Kestrel {rel['version']} is available")
+        top = self._dialog(f"Kestrel {updates.label(rel)} is available")
         tk.Frame(top, bg=RUFOUS, height=3).pack(fill="x")
         body = tk.Frame(top, bg=DUSK2, padx=24, pady=20)
         body.pack(fill="both", expand=True)
-        tk.Label(body, text=f"Kestrel {rel['version']} is available",
+        tk.Label(body, text=f"Kestrel {updates.label(rel)} is available",
                  bg=DUSK2, fg=BUFF, font=H2, anchor="w").pack(fill="x")
         tk.Label(body, text=f"You have {KVER}.", bg=DUSK2, fg=FAINT,
                  font=SANS_9, anchor="w").pack(fill="x", pady=(2, 0))
@@ -1083,6 +1146,16 @@ class App(ui.Resilient, tk.Tk):
         self.settings["check_updates"] = on
         save_settings(self.settings)
         if on:
+            self._check_updates(manual=True)
+
+    def _toggle_beta(self):
+        on = bool(self.beta_on.get())
+        self.settings["beta_updates"] = on
+        save_settings(self.settings)
+        if on:
+            self.toast("Beta versions will be offered too. They're tested, "
+                       "but newer — turn this off to stay on full "
+                       "releases.")
             self._check_updates(manual=True)
 
     # ------------------------------------------------------ announcements
@@ -1257,7 +1330,9 @@ class App(ui.Resilient, tk.Tk):
             rowf.configure(bg=DUSK2 if on else RAIL)
 
     def _page(self, f, title, subtitle=""):
-        p = tk.Frame(f, bg=DUSK)
+        page = ui.ScrollPage(f, bg=DUSK)
+        page.pack(fill="both", expand=True)
+        p = tk.Frame(page.inner, bg=DUSK)
         p.pack(fill="both", expand=True, padx=28, pady=22)
         tk.Label(p, text=title, bg=DUSK, fg=BUFF,
                  font=TITLE).pack(anchor="w")
@@ -1270,7 +1345,16 @@ class App(ui.Resilient, tk.Tk):
     def _chip(self, parent, title, sub=False):
         c = tk.Frame(parent, bg=DUSK2, highlightbackground=DUSK3,
                      highlightthickness=1)
-        c.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        # Tiles share their row evenly, and fold into two rows when the
+        # window is too narrow for four — they used to be packed side by
+        # side at their natural width, so the last one was cut off at the
+        # default window size.
+        tiles = getattr(parent, "_tiles", None)
+        if tiles is None:
+            tiles = parent._tiles = []
+            parent.bind("<Configure>", lambda e, p=parent: self._reflow(p))
+        tiles.append(c)
+        self._reflow(parent)
         tk.Label(c, text=title, bg=DUSK2, fg=FAINT,
                  font=MICRO_B).pack(anchor="w", padx=12, pady=(9, 0))
         var = tk.StringVar(value="—")
@@ -1284,8 +1368,27 @@ class App(ui.Resilient, tk.Tk):
                  font=TINY).pack(anchor="w", padx=12, pady=(0, 7))
         return var, svar
 
-    def toast(self, text, kind="info"):
-        self.toasts.show(text, kind)
+    @staticmethod
+    def _reflow(parent):
+        tiles = parent._tiles
+        n = len(tiles)
+        width = parent.winfo_width()
+        cols = n if (width <= 1 or width >= 170 * n) else max(1, (n + 1) // 2)
+        if getattr(parent, "_cols", None) == (cols, n):
+            return
+        parent._cols = (cols, n)
+        for i in range(max(n, 4)):
+            parent.columnconfigure(i, weight=0, uniform="")
+        for i, t in enumerate(tiles):
+            r, col = divmod(i, cols)
+            t.grid(row=r, column=col, sticky="nsew",
+                   padx=(0, 10 if col < cols - 1 else 0),
+                   pady=(0, 10 if r < (n - 1) // cols else 0))
+        for col in range(cols):
+            parent.columnconfigure(col, weight=1, uniform="tiles")
+
+    def toast(self, text, kind="info", key=None):
+        self.toasts.show(text, kind, key=key)
 
     def on_internal_error(self, where, exc):
         """Say something went wrong, once, without a wall of Python.
@@ -1316,7 +1419,7 @@ class App(ui.Resilient, tk.Tk):
         self.chip_found = self._chip(chips, "BLOCKS THIS SESSION")
         self.chip_life, self.chip_life_sub = self._chip(
             chips, "EARNED ALL-TIME", sub=True)
-        self.chip_sess.set("0.00000000 KSL")
+        self.chip_sess.set("0 KSL")
         self.chip_found.set("0")
         self._paint_lifetime()
 
@@ -1416,7 +1519,7 @@ class App(ui.Resilient, tk.Tk):
         tk.Label(right, textvariable=self.eta_var, bg=DUSK2, fg=FAINT,
                  font=TINY, anchor="w").pack(fill="x", pady=(6, 0))
         self.sess_var = tk.StringVar(value="")
-        tk.Label(right, textvariable=self.sess_var, bg=DUSK, fg=FAINT,
+        tk.Label(right, textvariable=self.sess_var, bg=DUSK2, fg=FAINT,
                  font=TINY).pack(anchor="e")
 
         tk.Frame(p, bg=DUSK3, height=1).pack(fill="x", pady=(14, 10))
@@ -1433,8 +1536,9 @@ class App(ui.Resilient, tk.Tk):
     def _paint_lifetime(self):
         lf = int(self.settings.get("lifetime_feathers", 0))
         lb = int(self.settings.get("lifetime_blocks", 0))
-        self.chip_life.set(format_ksl(lf))
-        self.chip_life_sub.set(f"{lb:,} block(s) mined with this app")
+        self.chip_life.set(ui.ksl_compact(lf))
+        self.chip_life_sub.set(f"{lb:,} block{'' if lb == 1 else 's'} "
+                               f"mined here")
 
     def _save_autostart(self):
         self.settings["autostart"] = bool(self.autostart_var.get())
@@ -1449,6 +1553,8 @@ class App(ui.Resilient, tk.Tk):
 
     @staticmethod
     def _fmt_eta(sec):
+        if sec < 1.5:
+            return "second"
         if sec < 90:
             return f"{sec:,.0f} seconds"
         if sec < 5400:
@@ -1793,9 +1899,13 @@ class App(ui.Resilient, tk.Tk):
         if not hasattr(self, "blocks_tv"):
             return
         my_addr = self.addr_e.get().strip() if hasattr(self, "addr_e") else ""
-        with self.lock:
+        with self._quick_lock() as got:
+            if not got:
+                return
             h = self.chain.height
-            if h == self._painted_h:
+            # repaint on a new block, and every half-minute regardless, so
+            # the "age" column doesn't sit on "2m" for an hour
+            if h == self._painted_h and time.time() - self._painted_at < 30:
                 return
             rows = []
             for b in self.chain.blocks[-100:][::-1]:
@@ -1812,6 +1922,7 @@ class App(ui.Resilient, tk.Tk):
                              mid_ellipsis(miner, 11),
                              miner == my_addr))
         self._painted_h = h
+        self._painted_at = time.time()
         self.blocks_tv.delete(*self.blocks_tv.get_children())
         for r in rows:
             tags = ("mine",) if r[-1] else ()
@@ -1920,8 +2031,9 @@ class App(ui.Resilient, tk.Tk):
                   tip="Re-check every node and sync right now"
                   ).pack(side="right")
         wrap, self.peers_tv = self._tree(
-            p, (("peer", 280, "w"), ("status", 90, "w"),
-                ("height", 90, "e"), ("seen", 130, "e")),
+            p, (("peer", 260, "w"), ("status", 80, "w"),
+                ("height", 90, "e"), ("version", 110, "w"),
+                ("seen", 110, "e")),
             height=6, stretch="peer")
         wrap.pack(fill="both", expand=True)
         pm = tk.Menu(self.peers_tv, tearoff=0, bg=DUSK2, fg=BUFF,
@@ -2226,6 +2338,21 @@ class App(ui.Resilient, tk.Tk):
         self.q.put(("log", msg, tag, None))
         self.q.put(("stats",))
 
+    @contextlib.contextmanager
+    def _quick_lock(self, timeout: float = 0.15):
+        """The node lock, for a screen refresh that can wait its turn.
+
+        A refresh that finds the node busy — validating a batch of blocks,
+        switching forks — skips this tick instead of freezing the window
+        until the node is done; the next tick is only seconds away.
+        """
+        got = self.lock.acquire(timeout=timeout)
+        try:
+            yield got
+        finally:
+            if got:
+                self.lock.release()
+
     def _handle(self, kind, rest):
         """One message from a worker thread. Failures here are
         reported and skipped — they can no longer take the loop
@@ -2240,9 +2367,9 @@ class App(ui.Resilient, tk.Tk):
             n, feathers = rest
             s = "" if n == 1 else "s"
             self.found_var.set(
-                f"You have mined {n} block{s} this session — "
-                f"{format_ksl(feathers)} earned")
-            self.chip_sess.set(format_ksl(feathers))
+                f"You have mined {n:,} block{s} this session — "
+                f"{ui.ksl_compact(feathers)} earned")
+            self.chip_sess.set(ui.ksl_compact(feathers))
             self.chip_found.set(f"{n:,}")
         elif kind == "foundrow":
             height, nonce, reward = rest
@@ -2254,9 +2381,19 @@ class App(ui.Resilient, tk.Tk):
                 values=(time.strftime("%H:%M:%S"), f"{height:,}",
                         f"{nonce:,}", "+" + format_ksl(reward)))
             self._zebra(self.found_tv)
-            self.toast(f"★ Block {height:,} mined — "
-                       f"+{format_ksl(reward)} to your address",
-                       "good")
+            # one card that keeps count, rather than a new card per block
+            self._toast_run = getattr(self, "_toast_run", None)
+            now = time.time()
+            if self._toast_run and now - self._toast_run[0] < 6:
+                n, total = self._toast_run[1] + 1, self._toast_run[2] + reward
+            else:
+                n, total = 1, reward
+            self._toast_run = (now, n, total)
+            text = (f"★ Block {height:,} mined — +{ui.ksl_compact(reward)} "
+                    f"to your address" if n == 1 else
+                    f"★ {n} blocks mined — +{ui.ksl_compact(total)}, "
+                    f"latest {height:,}")
+            self.toast(text, "good", key="found")
         elif kind == "lifetime":
             reward = rest[0]
             self.settings["lifetime_feathers"] = \
@@ -2483,6 +2620,7 @@ class App(ui.Resilient, tk.Tk):
             self._set_address(saved, remember=False)
             self.log("Welcome back — rewards go to your saved address.", "hi")
             return
+        damaged = False
         if os.path.exists(WALLET_FILE):
             try:
                 w = Wallet.load(WALLET_FILE)
@@ -2490,12 +2628,31 @@ class App(ui.Resilient, tk.Tk):
                 self.log("Welcome back — rewards go to your saved address.",
                          "hi")
                 return
-            except Exception:
-                pass
+            except Exception as e:
+                damaged = True
+                logfile.write(f"wallet file could not be read ({e}) — "
+                              f"keeping it aside and making a new one",
+                              level="warn")
         w = Wallet.create()
-        w.save(WALLET_FILE)
+        kept = w.save(WALLET_FILE)
         self._set_address(w.address)
         self.log("Created your reward address automatically.", "good")
+        if damaged and kept:
+            name = os.path.basename(kept)
+            self.after(700, lambda: self._say_when_free(
+                "Your old wallet file was kept",
+                "kestrel-wallet.json in this folder could not be read, so a "
+                "new wallet was made. Nothing was deleted: the old file is "
+                f"now\n\n  {name}\n\nIf it held coins, its key may still "
+                "be recoverable — keep that file safe and ask for help "
+                "in the community chat. Nobody there will ever need the "
+                "file itself or your key.", kind="warn"))
+        # Shown once the window is up rather than from inside __init__: a
+        # modal dialog there held back everything after it — the node did
+        # not start, and nothing refreshed, until the dialog was closed.
+        self.after(600, lambda: self._welcome(w))
+
+    def _welcome(self, w):
         self._say(
             "Your reward address is ready",
             "Address:\n" + w.address +
@@ -2580,6 +2737,7 @@ class App(ui.Resilient, tk.Tk):
     def toggle(self):
         if self.mining.is_set():
             self.mining.clear()
+            self._run = None
             self.mine_btn.configure(text="▶  Start mining", bg=RUFOUS,
                                     fg=DUSK, activebackground=RUFOUS_HI,
                                     activeforeground=DUSK)
@@ -2606,13 +2764,21 @@ class App(ui.Resilient, tk.Tk):
             self.settings["threads"] = threads
             save_settings(self.settings)
         self.mining.set()
+        run = self._run = object()
         self.mine_btn.configure(text="■  Stop mining", bg=DUSK3, fg=BUFF,
                                 activebackground=HOVER,
                                 activeforeground=BUFF)
-        threading.Thread(target=self._mine_loop, args=(address, threads),
+        threading.Thread(target=self._mine_loop,
+                         args=(address, threads, run),
                          daemon=True).start()
 
-    def _mine_loop(self, address, threads):
+    def _mining_for(self, run) -> bool:
+        """Is this particular run still the one the user wants?"""
+        return self.mining.is_set() and self._run is run
+
+    def _mine_loop(self, address, threads, run=None):
+        if run is None:
+            run = self._run
         # Never start building blocks before we know whether anyone else is
         # out there. At the starting difficulty a few seconds of solo mining
         # can outweigh the real network, and once that happens this node
@@ -2624,7 +2790,7 @@ class App(ui.Resilient, tk.Tk):
             self.log("Checking for other nodes before mining, so this "
                      "computer can't start a chain of its own by mistake…")
             state = self.node.wait_until_known(timeout=45)
-            if not self.mining.is_set():
+            if not self._mining_for(run):
                 return
             if state == "joined":
                 self.log("Connected. Mining on the shared chain.", "good")
@@ -2635,7 +2801,7 @@ class App(ui.Resilient, tk.Tk):
 
         self.log(f"Mining on {threads} CPU thread(s). Every block found "
                  f"pays the reward to {address[:14]}…", "hi")
-        while self.mining.is_set():
+        while self._mining_for(run):
             with self.lock:
                 block = assemble_candidate(self.chain, address,
                                            message="kestrel-miner-app")
@@ -2646,7 +2812,7 @@ class App(ui.Resilient, tk.Tk):
             def watch():
                 # stop this round if the user stops, or the chain moves on
                 while not round_stop.is_set():
-                    if not self.mining.is_set():
+                    if not self._mining_for(run):
                         round_stop.set(); return
                     with self.lock:
                         moved = self.chain.tip.block_id != tip_id
@@ -2658,13 +2824,16 @@ class App(ui.Resilient, tk.Tk):
             watcher.start()
             ok = find_pow(block, threads=threads, stop=round_stop,
                           max_seconds=25,
-                          on_progress=lambda r: self.q.put(("rate", r)))
+                          on_progress=lambda r: self._mining_for(run)
+                          and self.q.put(("rate", r)))
             round_stop.set()
 
-            if not self.mining.is_set():
-                break
             if not ok:
+                if not self._mining_for(run):
+                    break
                 continue  # stale tip or round over — fresh candidate
+            # A solution found in the same instant Stop was pressed is
+            # still real work and still pays; it is kept, not thrown away.
             try:
                 with self.lock:
                     self.chain.add_block(block)
@@ -2682,8 +2851,10 @@ class App(ui.Resilient, tk.Tk):
             except ValidationError:
                 self.log("That block arrived a moment too late — continuing.",
                          "bad")
-        self.q.put(("rate", 0.0))
-        self.log("Mining stopped.")
+        if self._run is None or self._run is run:
+            # only the run that is actually ending gets to zero the gauge
+            self.q.put(("rate", 0.0))
+            self.log("Mining stopped.")
 
     # ---------------------------------------------------------------- wallet
     def _view_wallet(self, f):
@@ -2772,13 +2943,25 @@ class App(ui.Resilient, tk.Tk):
         wrap.pack(fill="both", expand=True)
 
     def _w_wallet(self):
-        """The wallet this app owns the keys for, if any."""
+        """The wallet this app owns the keys for, if any.
+
+        Asked for every few seconds by the refresh loop; the file is only
+        read (and the public key re-derived) when it has actually changed.
+        """
         try:
-            if os.path.exists(WALLET_FILE):
-                return Wallet.load(WALLET_FILE)
+            st = os.stat(WALLET_FILE)
+        except OSError:
+            self._wallet_cache = None
+            return None
+        stamp = (st.st_mtime_ns, st.st_size)
+        if self._wallet_cache and self._wallet_cache[0] == stamp:
+            return self._wallet_cache[1]
+        try:
+            w = Wallet.load(WALLET_FILE)
         except Exception:
-            pass
-        return None
+            w = None
+        self._wallet_cache = (stamp, w)
+        return w
 
     def _w_copy_addr(self):
         a = self.w_addr_var.get()
@@ -2901,7 +3084,6 @@ class App(ui.Resilient, tk.Tk):
         rather than keeping a second, wronger copy here.
         """
         try:
-            self.node._reindex()
             return self.node._deltas_of(tx).get(addr, 0)
         except Exception:
             # worst case, fall back to outputs only; better a row that
@@ -2925,41 +3107,36 @@ class App(ui.Resilient, tk.Tk):
         if own and is_valid_address(payout) and payout != own.address:
             self._w_say("Note: mining rewards are going to a different "
                         "address you pasted in, not this one.")
-        with self.lock:
+        with self._quick_lock() as got:
+            if not got:
+                return                      # node busy: next tick
             bal = self.chain.balance(addr)
             height = self.chain.height
             rows, mem_rows = [], []
-            for b in reversed(self.chain.blocks[-400:]):
-                for tx in b.transactions:
-                    # What this payment did to THIS address, on balance.
-                    # Counting only the outputs made every payment you
-                    # SENT look like money arriving, because the change
-                    # comes back to you: send 10 of 25 and the tab
-                    # cheerfully reported "Received 14.99999 KSL" while
-                    # your balance had just gone down.
-                    delta = self._net_delta(tx, addr)
-                    if not delta:
-                        continue
-                    confs = height - b.height + 1
-                    if tx.is_coinbase:
-                        kind = "Mined"
-                        status = ("spendable" if confs >= params.COINBASE_MATURITY
-                                  else f"matures in "
-                                       f"{params.COINBASE_MATURITY - confs} blocks")
-                    elif delta > 0:
-                        kind = "Received"
-                        status = f"{confs} confirmation(s)"
-                    else:
-                        kind = "Sent"
-                        status = f"{confs} confirmation(s)"
-                    rows.append((time.strftime("%d %b, %H:%M",
-                                               time.localtime(b.timestamp)),
-                                 kind,
-                                 format_ksl(abs(delta)), status))
-                    if len(rows) >= 60:
-                        break
-                if len(rows) >= 60:
-                    break
+            # History comes from the node's address index, which covers the
+            # whole chain. This used to scan only the newest 400 blocks —
+            # about thirteen hours — so a miner whose rewards were older
+            # than that saw "Nothing yet" under a balance of thousands. The
+            # index is filled in slices, so a long chain never stalls the
+            # window while it is being built.
+            indexed = self.node._reindex(limit=2000)
+            entries = self.node._addr_index.get(addr, [])[-60:]
+            for h, _txid, delta, cb, ts in reversed(entries):
+                confs = height - h + 1
+                if cb:
+                    kind = "Mined"
+                    status = ("spendable" if confs >= params.COINBASE_MATURITY
+                              else f"matures in "
+                                   f"{params.COINBASE_MATURITY - confs} blocks")
+                elif delta > 0:
+                    kind = "Received"
+                    status = f"{confs:,} confirmation{'s' if confs != 1 else ''}"
+                else:
+                    kind = "Sent"
+                    status = f"{confs:,} confirmation{'s' if confs != 1 else ''}"
+                rows.append((time.strftime("%d %b %Y, %H:%M",
+                                           time.localtime(ts)),
+                             kind, format_ksl(abs(delta)), status))
             # In-flight payments, with how long they have been waiting.
             # "waiting for a block" with no clock attached is what let a
             # payment claim to be on its way indefinitely; the age says
@@ -2979,13 +3156,13 @@ class App(ui.Resilient, tk.Tk):
                     status, tag = "waiting for a block", "pend"
                 else:
                     status, tag = f"waiting {ui.fmt_age(age)}", "pend"
-                when = time.strftime("%d %b, %H:%M", time.localtime(seen))
+                when = time.strftime("%d %b %Y, %H:%M", time.localtime(seen))
                 mem_rows.append((tag, (when,
                                        "Incoming" if delta > 0 else "Outgoing",
                                        format_ksl(abs(delta)), status)))
-        self.chip_w_spend.set(format_ksl(bal["spendable"]))
-        self.chip_w_conf.set(format_ksl(bal["confirmed"]))
-        self.chip_w_imm.set(format_ksl(bal["confirmed"] - bal["spendable"]))
+        self.chip_w_spend.set(ui.ksl_compact(bal["spendable"]))
+        self.chip_w_conf.set(ui.ksl_compact(bal["confirmed"]))
+        self.chip_w_imm.set(ui.ksl_compact(bal["confirmed"] - bal["spendable"]))
         tv = self.w_tx
         tv.delete(*tv.get_children())
         for tag, r in mem_rows:
@@ -2993,7 +3170,9 @@ class App(ui.Resilient, tk.Tk):
         for r in rows:
             tv.insert("", "end", values=r)
         ui.zebra(tv)
-        self._hint_if_empty(tv, "Nothing yet — mine a block to get paid.")
+        self._hint_if_empty(tv, "Nothing yet — mine a block to get paid."
+                            if indexed else
+                            "Reading your history from the ledger…")
 
     def _refresh_stats(self):
         try:
@@ -3007,7 +3186,9 @@ class App(ui.Resilient, tk.Tk):
             self.report("wallet tab", e)
             self._wallet_err = str(e)
         addr = self.addr_e.get().strip()
-        with self.lock:
+        with self._quick_lock() as got:
+            if not got:
+                return                      # node busy: next tick
             h = self.chain.height
             supply = self.chain.circulating_supply()
             reward = self.chain.block_subsidy(h + 1)
@@ -3019,20 +3200,20 @@ class App(ui.Resilient, tk.Tk):
             mem = len(self.chain.mempool)
         alive = len(self.node.alive_peers())
         known = len(self.node.peers)
-        mined = format_ksl(supply).replace(" KSL", "")
+        mined = ui.ksl_compact(supply).replace(" KSL", "")
         _h, target = self.node.sync_status()
         if target > h:
             line = (f"⬇ Downloading the public ledger…  block {h:,} "
                     f"of {target:,}   ·   {alive} node(s) online")
         else:
             line = (f"Block {h:,}   ·   {mined} of 44,000,000 KSL mined"
-                    f"   ·   next block pays {format_ksl(reward)}"
+                    f"   ·   next block pays {ui.ksl_compact(reward)}"
                     f"   ·   {alive} node(s) online")
         if bal is not None:
-            line += f"   ·   Your balance: {format_ksl(bal)}"
+            line += f"   ·   Your balance: {ui.ksl_compact(bal)}"
         self.status_var.set(line)
         self.updated_var.set("updated " + time.strftime("%H:%M:%S"))
-        self.chip_bal.set(format_ksl(bal) if bal is not None else "—")
+        self.chip_bal.set(ui.ksl_compact(bal) if bal is not None else "—")
 
         # network context line on the Mine page
         net_rate = self._block_work / max(params.TARGET_BLOCK_TIME, 1)
@@ -3041,7 +3222,10 @@ class App(ui.Resilient, tk.Tk):
         parts = [f"difficulty {diff:,.2f}",
                  f"whole network ≈ {fmt_rate(net_rate)}"]
         if self._cur_rate > 0 and net_rate > 0:
-            share = self._cur_rate / net_rate * 100
+            # The network estimate comes from the difficulty, which lags
+            # the real hash rate; this machine can briefly outrun it and a
+            # share of 9,000% helps no one. Nobody's share exceeds 100%.
+            share = min(self._cur_rate / net_rate * 100, 100.0)
             parts.append("your share ≈ "
                          + (f"{share:,.1f}%" if share >= 0.1 else "<0.1%"))
         parts.append(f"next halving in {to_halving:,} blocks"
@@ -3129,10 +3313,12 @@ class App(ui.Resilient, tk.Tk):
             seen = "—"
             if last:
                 seen = ago(last)
+            soft = str(i.get("software") or "—").replace("kestrel/", "")
             self.peers_tv.insert(
                 "", "end", tags=(tag,),
                 values=(url, status,
-                        f"{height:,}" if height is not None else "—", seen))
+                        f"{height:,}" if isinstance(height, int) else "—",
+                        soft, seen))
         self._hint_if_empty(self.peers_tv,
                             "No nodes yet — they appear here automatically")
         self._zebra(self.peers_tv)
@@ -3157,5 +3343,24 @@ class App(ui.Resilient, tk.Tk):
         self.destroy()
 
 
+def main():
+    try:
+        app = App()
+    except tk.TclError as e:
+        # No display: started over SSH, from a service, or on a desktop
+        # that isn't running yet. Say so plainly instead of a traceback.
+        msg = (f"Kestrel Miner could not open its window ({e}). It needs a "
+               f"desktop session; to run a node without one, use "
+               f"kestrel-core: python -m kestrel.cli node")
+        logfile.setup(_HERE, "startup", quiet=True)
+        logfile.write(msg, level="error", to_console=False)
+        try:
+            print(msg, file=sys.stderr)
+        except Exception:
+            pass
+        sys.exit(1)
+    app.mainloop()
+
+
 if __name__ == "__main__":
-    App().mainloop()
+    main()
