@@ -1,41 +1,26 @@
-# Kestrel v1.4.8
+# Kestrel v1.4.9
 
 **Fixed**
 
-- A received payment stayed "on its way" until you restarted the app.
-- Pending transactions never expired, so a dropped one sat there forever.
-- The wallet could show a balance it would then refuse to spend.
-- A losing double-spend was reported as confirmed.
-- After syncing from a peer, a restart could duplicate the chain file and wipe the mempool.
-- A failed disk write during a reorg could splice two chains together.
-- One slow client could freeze the whole node.
-- A peer-book race could silently kill background maintenance for the rest of the run.
-- One exception could freeze the whole window.
-- Notifications floated outside the app and drifted when you moved or switched windows. They are part of the window now.
-- The miner's wallet tab counted your own change as money received.
-- A screenful of Python could appear over your terminal.
+- Switching to a heavier chain froze the node for half a minute or more. Now it only checks the blocks after the fork, and a reorg no longer rewrites the whole ledger file.
+- The in-app updater could delete your own files, including a backup key — and if it couldn't read your wallet, it replaced it instead of setting it aside. Both fixed; this version also restores anything the old updater removed.
+- Sending: a timed-out payment could show as failed when it had gone through, and retrying paid twice. Fixed, with a warning before any duplicate payment.
+- Windows launchers (`run.bat`, `start.bat`) could fail from wrong line endings; run.sh lost its permissions after an update on Mac/Linux; "externally managed" Pythons (Debian 12+, Ubuntu 23.04+, Homebrew) failed to launch at all. All fixed.
+- Smaller fixes: double-mining from a fast Stop/Start, wallet history capped at 13 hours, a damaged mempool file blocking startup, one bad Wi-Fi packet disabling LAN discovery, a failed update leaving the app closed, a slow peer stalling sync for everyone.
 
 **New**
 
-- In-app updates. The app notices a new release, shows what changed, and installs it if you say yes. It never touches your wallet, address book, settings or chain data.
-- Payments show how long they have been waiting.
-- A screen that has stopped updating now says so instead of showing stale numbers.
-- The launcher offers to install Python for you if it is missing.
+- Optional beta versions: *Settings → Get beta versions too*. Off by default.
+- Downloads are checked against GitHub's own SHA-256 for each file; the release zips are reproducible from the tag.
+- Pending payments are re-sent every ten minutes so one from behind a router can't get stranded.
+- Pages scroll properly on small windows. `/health` for monitoring; peer versions shown in the Network tab.
 
 **Faster**
 
-- The chain is no longer rewritten from scratch on every block.
-- Opening the app no longer re-verifies the entire chain.
-- One bad block no longer costs you the whole chain.
-- A disk that won't take a write no longer stops a node.
-- Dragging and resizing the window is much lighter.
+- The node stays responsive while catching up or switching forks. Balances, the rich list and the explorer index no longer rescan the whole chain.
 
-**Also**
-
-- Both apps redesigned.
-- New website.
-- 134 tests, all running.
+214 tests, run on Python 3.10 to 3.13.
 
 ---
 
-Anyone on v1.4.7 has to update by hand this once — the updater ships *in* this version. After this it is automatic.
+Updating from 1.4.8 in the app works as before. The first start of 1.4.9 repairs anything the 1.4.8 updater got wrong, and tells you if it put files back.
